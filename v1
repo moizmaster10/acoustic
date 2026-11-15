@@ -1,0 +1,1327 @@
+/*
+ * StructuralMonitor.ino
+ * STRUCTURAL INTEGRITY MONITORING SYSTEM - ESP32 + ADXL345 (I2C 0x53)
+ *
+ * - Standalone Wi-Fi AP "Monitor" (192.168.4.1), dashboard served from this sketch.
+ * - ADXL345 driven directly over I2C, FIFO stream mode, 200 Hz ODR, full-res +/-4 g.
+ * - Window = 256 samples. Effective sampling rate is measured from exact FIFO sample
+ *   counts against micros() timestamps (not assumed from a delay).
+ * - Per-axis Hamming window + radix-2 FFT, combined vector spectrum.
+ * - Baseline = average of several valid windows. Similarity score = 100*(1-weighted
+ *   normalized deviation). EXPERIMENTAL vibration-response similarity, NOT a certified
+ *   structural integrity or safety rating.
+ * - Persistent storage in NVS (Preferences). Bounded: 3 objects, 3 baselines, 6 measurements.
+ * - Motor is DISABLED. No motor GPIO is touched.
+ *
+ * Similarity formula (see compareFeat):
+ *   d_rms  = min(1, |c-b| / max(c, b, NOISE_FLOOR))          same for peak
+ *   d_freq = min(1, |fc-fb| / max(fb, 5 Hz))
+ *   d_fft  = sum|Sc-Sb| / sum(Sc+Sb)                         64-bin magnitude spectra
+ *   d_band = 0.5 * sum|Ec_i-Eb_i|                            4 relative band energies
+ *   Deviation = sum(w_i*d_i) / sum(w_i over AVAILABLE features)
+ *   Score = clamp(100*(1-Deviation), 0, 100)
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Preferences.h>
+#include <math.h>
+
+// ============================ CONFIGURATION ============================
+#define SDA_PIN        21
+#define SCL_PIN        22
+#define ADXL_ADDR      0x53
+#define AP_SSID        "Monitor"
+#define AP_PASS        "12345678gi"
+
+#define N_SAMP         256            // samples per window (power of 2)
+#define N_BINS         (N_SAMP/2)     // 128
+#define N_SPEC         64             // stored spectrum bins
+#define N_BANDS        4
+#define FS_NOMINAL     200.0f         // must match ADXL_RATE_CODE
+#define ADXL_RATE_CODE 0x0B           // 0x0A=100Hz 0x0B=200Hz 0x0C=400Hz
+#define CLIP_RAW       1000           // |raw| >= this (LSB, full-res +/-4g) = clipping
+
+#define MAX_OBJ        3
+#define MAX_HIST       6
+#define BL_MIN_WIN     3
+#define BL_MAX_WIN     10
+#define BL_MAX_REJECT  20
+
+// Similarity feature weights (order: RMS, PEAK, DOM FREQ, FFT, BAND ENERGY). Edit here.
+const float W_FEAT[5] = {0.20f, 0.10f, 0.25f, 0.30f, 0.15f};
+const char* FEAT_NAMES[5] = {"RMS", "Peak", "Dominant frequency", "FFT spectrum", "Band energy"};
+
+const float ACC_LSB_MS2 = 0.0039f * 9.80665f;   // full-resolution: 3.9 mg/LSB -> m/s^2
+const float NOISE_FLOOR = 0.05f;                // m/s^2, normalisation guard
+const float LOWSIG_RMS  = 0.06f;                // below this: near sensor noise floor
+const float BAND_EDGE[3] = {10.0f, 25.0f, 50.0f};
+
+#define Q_INVALID      0
+#define Q_POOR         1
+#define Q_ACCEPTABLE   2
+#define Q_GOOD         3
+
+const uint16_t F_CLIP=1, F_TIMING=2, F_IRREG=4, F_OVERRUN=8, F_LOWSIG=16,
+               F_GRAV=32, F_STUCK=64, F_SENSOR=128, F_SHORT=256;
+
+#define MAGIC_BASE 0x42534C31UL
+#define MAGIC_MEAS 0x4D45531AUL
+
+// ============================ TYPES ============================
+struct Feat {
+  float rms, peak, p2p, sd, domF, fs;
+  float band[N_BANDS];
+  float specMax;
+  uint8_t spec[N_SPEC];
+};
+struct BaseRec {
+  uint32_t magic, id, ts;
+  uint16_t windows, reserved;
+  Feat f;
+};
+struct MeasRec {
+  uint32_t magic, id, ts, baseId;
+  float score;
+  float dev[5];
+  uint8_t quality, hasScore, obj, reserved;
+  uint16_t flags, clip;
+  uint16_t samples, reserved2;
+  Feat f;
+};
+struct Result {
+  uint32_t winId, measId, ts, baseId;
+  uint8_t quality, state;      // state: 0 none,1 score,2 baseline required,3 insufficient,4 not comparable
+  uint16_t flags, clip;
+  float fsEff, gmag;
+  float axRms[3], axP2p[3];
+  bool hasScore;
+  float score;
+  float dev[5];
+  Feat f;
+};
+enum Mode { M_IDLE, M_TEST, M_BASELINE };
+enum BlPhase { BL_IDLE, BL_REC, BL_REVIEW };
+
+// ============================ GLOBALS ============================
+WebServer server(80);
+Preferences prefs;
+bool storageOk = false;
+
+// sensor
+bool sensorOk = false;
+uint32_t sensorErrors = 0, lastSensorPing = 0, lastReinit = 0;
+int16_t lastRaw[3] = {0, 0, 0};
+bool haveLast = false;
+uint32_t lastSampleMs = 0;
+
+// acquisition
+int16_t rawBuf[3][N_SAMP];
+bool acqActive = false, acqDone = false, acqErr = false, acqOverrun = false;
+uint16_t acqCount = 0, acqClip = 0;
+uint32_t acqTotal = 0, acqT0 = 0, acqLastT = 0, acqMidT = 0, acqMidTotal = 0, acqLastDataMs = 0;
+uint32_t lastAcqTry = 0;
+
+// processing
+float wx[N_SAMP], wy[N_SAMP], wz[N_SAMP];     // latest window, DC removed, m/s^2
+float curA[N_BINS + 1];                       // latest combined amplitude spectrum
+float fre[N_SAMP], fim[N_SAMP];
+float twc[N_SAMP / 2], tws[N_SAMP / 2], hw[N_SAMP], hwSum = 1;
+Result cur;
+bool haveWin = false;
+uint32_t winCounter = 0, dataWin = 0, testStartWin = 0;
+
+// state
+Mode mode = M_IDLE;
+BlPhase blPhase = BL_IDLE;
+int8_t blObj = -1;
+uint8_t blAccepted = 0, blRejected = 0;
+float blSum[5];
+float blSumA[N_BINS + 1];
+BaseRec blCand;
+bool blCandValid = false;
+String blMsg = "";
+
+// persistent data (RAM cache)
+String objPack[MAX_OBJ];
+bool objUsed[MAX_OBJ];
+int8_t activeObj = -1;
+BaseRec baseCache[MAX_OBJ];
+bool baseValid[MAX_OBJ];
+MeasRec hist[MAX_HIST];
+bool histValid[MAX_HIST];
+uint32_t nextMeasId = 1, nextBaseId = 1;
+
+// time sync from browser
+bool timeSynced = false;
+uint32_t epochBase = 0, epochSyncMs = 0;
+
+const char* OBJ_FIELDS[17] = {"name","oid","cat","len","wid","thk","mat","age","inst","cond",
+                              "defects","repairs","env","pos","orient","attach","excit"};
+const char* MATERIALS[7] = {"Aluminium","Mild steel","Stainless steel","Concrete","Wood","PVC","Other"};
+
+#define U(x) String((unsigned long)(x))
+
+// ============================ HELPERS ============================
+uint32_t epochNow() {
+  if (!timeSynced) return 0;
+  return epochBase + (millis() - epochSyncMs) / 1000UL;
+}
+String jstr(const String& v) {
+  String o = "\"";
+  for (size_t i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((uint8_t)c < 0x20) o += ' ';
+    else o += c;
+  }
+  o += '"';
+  return o;
+}
+String jnum(float v, uint8_t d = 3) {
+  if (!isfinite(v)) return "null";
+  return String(v, (unsigned int)d);
+}
+String jbool(bool b) { return b ? "true" : "false"; }
+const char* qName(uint8_t q) {
+  switch (q) { case Q_GOOD: return "GOOD"; case Q_ACCEPTABLE: return "ACCEPTABLE"; case Q_POOR: return "POOR"; default: return "INVALID"; }
+}
+const char* stateName(uint8_t s) {
+  switch (s) { case 1: return "score"; case 2: return "baseline_required"; case 3: return "insufficient"; case 4: return "not_comparable"; default: return "none"; }
+}
+const char* scoreCat(float s) {
+  if (s >= 85) return "HIGH SIMILARITY";
+  if (s >= 65) return "MODERATE DEVIATION";
+  if (s >= 40) return "SIGNIFICANT DEVIATION";
+  return "LARGE DEVIATION";
+}
+String issuesJson(uint16_t fl) {
+  String s = "[";
+  bool first = true;
+  struct { uint16_t b; const char* t; } L[9] = {
+    {F_SENSOR, "Sensor communication error"}, {F_SHORT, "Insufficient samples"},
+    {F_OVERRUN, "FIFO overrun - samples lost"}, {F_CLIP, "Clipping / saturation detected"},
+    {F_TIMING, "Sampling rate deviates from nominal"}, {F_IRREG, "Irregular sample timing"},
+    {F_STUCK, "Sensor output constant (frozen)"}, {F_LOWSIG, "Low signal level (near sensor noise floor)"},
+    {F_GRAV, "Gravity magnitude outside expected range"}};
+  for (int i = 0; i < 9; i++) if (fl & L[i].b) { if (!first) s += ","; s += jstr(L[i].t); first = false; }
+  return s + "]";
+}
+static inline float specAt(const Feat& f, int j) { return f.spec[j] * f.specMax / 255.0f; }
+
+void sendJson(int code, const String& body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(code, "application/json", body);
+}
+void sendErr(int code, const String& msg) { sendJson(code, "{\"ok\":false,\"error\":" + jstr(msg) + "}"); }
+void sendOk(const String& extra = "") { sendJson(200, "{\"ok\":true" + extra + "}"); }
+
+// ============================ ADXL345 ============================
+bool adxlWrite(uint8_t reg, uint8_t v) {
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(reg); Wire.write(v);
+  return Wire.endTransmission() == 0;
+}
+bool adxlRead(uint8_t reg, uint8_t* buf, uint8_t n) {
+  Wire.beginTransmission(ADXL_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  uint8_t got = Wire.requestFrom((uint8_t)ADXL_ADDR, (uint8_t)n);
+  if (got != n) { while (Wire.available()) Wire.read(); return false; }
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+bool adxlInit() {
+  uint8_t id = 0;
+  if (!adxlRead(0x00, &id, 1) || id != 0xE5) return false;
+  if (!adxlWrite(0x2D, 0x00)) return false;              // standby
+  if (!adxlWrite(0x2E, 0x00)) return false;              // interrupts off
+  if (!adxlWrite(0x2C, ADXL_RATE_CODE)) return false;    // output data rate
+  if (!adxlWrite(0x31, 0x09)) return false;              // FULL_RES, +/-4 g
+  if (!adxlWrite(0x38, 0x00)) return false;              // bypass (clears FIFO)
+  if (!adxlWrite(0x38, 0x9F)) return false;              // stream mode
+  if (!adxlWrite(0x2D, 0x08)) return false;              // measure
+  delay(20);
+  uint8_t chk[2], df = 0;
+  if (!adxlRead(0x2C, chk, 2) || !adxlRead(0x31, &df, 1)) return false;
+  return (chk[0] == ADXL_RATE_CODE && chk[1] == 0x08 && df == 0x09);
+}
+void sensorIdleService() {
+  if (acqActive) return;
+  uint32_t now = millis();
+  if (!sensorOk) {
+    if (now - lastReinit > 2000) {
+      lastReinit = now;
+      sensorOk = adxlInit();
+      if (sensorOk) Serial.println("[ADXL345] (re)initialised");
+    }
+    return;
+  }
+  if (now - lastSensorPing > 250) {
+    lastSensorPing = now;
+    uint8_t b[6];
+    if (adxlRead(0x32, b, 6)) {
+      lastRaw[0] = (int16_t)((b[1] << 8) | b[0]);
+      lastRaw[1] = (int16_t)((b[3] << 8) | b[2]);
+      lastRaw[2] = (int16_t)((b[5] << 8) | b[4]);
+      haveLast = true; lastSampleMs = now;
+    } else { sensorOk = false; sensorErrors++; haveLast = false; Serial.println("[ADXL345] read failed"); }
+  }
+}
+
+// ============================ ACQUISITION ============================
+bool acqStart() {
+  if (!sensorOk) return false;
+  uint8_t st = 0; bool empty = false;
+  for (int i = 0; i < 48; i++) {                         // flush FIFO
+    if (!adxlRead(0x39, &st, 1)) { sensorOk = false; sensorErrors++; return false; }
+    if ((st & 0x3F) == 0) { acqT0 = micros(); empty = true; break; }
+    uint8_t b[6];
+    if (!adxlRead(0x32, b, 6)) { sensorOk = false; sensorErrors++; return false; }
+  }
+  if (!empty) return false;
+  uint8_t src = 0; adxlRead(0x30, &src, 1);              // clear overrun flag
+  acqCount = 0; acqTotal = 0; acqClip = 0; acqMidT = 0; acqMidTotal = 0; acqLastT = acqT0;
+  acqDone = false; acqErr = false; acqOverrun = false; acqActive = true;
+  acqLastDataMs = millis();
+  return true;
+}
+void acqFail() { acqErr = true; sensorOk = false; sensorErrors++; haveLast = false; }
+void acqPoll() {
+  if (!acqActive || acqDone || acqErr) return;
+  uint8_t st = 0;
+  if (!adxlRead(0x39, &st, 1)) { acqFail(); return; }
+  uint32_t tS = micros();
+  uint8_t entries = st & 0x3F;
+  if (entries == 0) { if (millis() - acqLastDataMs > 1000) acqFail(); return; }
+  uint8_t src = 0;
+  if (adxlRead(0x30, &src, 1) && (src & 0x01)) acqOverrun = true;
+  if (entries >= 32) acqOverrun = true;
+  for (uint8_t i = 0; i < entries; i++) {
+    uint8_t b[6];
+    if (!adxlRead(0x32, b, 6)) { acqFail(); return; }
+    int16_t x = (int16_t)((b[1] << 8) | b[0]);
+    int16_t y = (int16_t)((b[3] << 8) | b[2]);
+    int16_t z = (int16_t)((b[5] << 8) | b[4]);
+    lastRaw[0] = x; lastRaw[1] = y; lastRaw[2] = z; haveLast = true; lastSampleMs = millis();
+    if (acqCount < N_SAMP) {
+      rawBuf[0][acqCount] = x; rawBuf[1][acqCount] = y; rawBuf[2][acqCount] = z;
+      if (abs(x) >= CLIP_RAW || abs(y) >= CLIP_RAW || abs(z) >= CLIP_RAW) acqClip++;
+      acqCount++;
+    }
+    acqTotal++;
+  }
+  acqLastT = tS; acqLastDataMs = millis();
+  if (acqMidTotal == 0 && acqTotal >= N_SAMP / 2) { acqMidT = tS; acqMidTotal = acqTotal; }
+  if (acqCount >= N_SAMP) acqDone = true;
+}
+
+// ============================ DSP ============================
+void dspInit() {
+  for (int i = 0; i < N_SAMP / 2; i++) { float a = 2.0f * PI * i / N_SAMP; twc[i] = cosf(a); tws[i] = sinf(a); }
+  hwSum = 0;
+  for (int i = 0; i < N_SAMP; i++) { hw[i] = 0.54f - 0.46f * cosf(2.0f * PI * i / (N_SAMP - 1)); hwSum += hw[i]; }
+}
+void fft(float* re, float* im) {               // in-place radix-2 DIT
+  for (int i = 1, j = 0; i < N_SAMP; i++) {
+    int bit = N_SAMP >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (int len = 2; len <= N_SAMP; len <<= 1) {
+    int half = len >> 1, step = N_SAMP / len;
+    for (int i = 0; i < N_SAMP; i += len) {
+      for (int k = 0; k < half; k++) {
+        float wr = twc[k * step], wi = -tws[k * step];
+        int a = i + k, b = a + half;
+        float tr = re[b] * wr - im[b] * wi;
+        float ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr;        im[a] += ti;
+      }
+    }
+  }
+}
+void buildFeat(Feat& f, const float* A, float rms, float peak, float p2p, float sd, float fs) {
+  memset(&f, 0, sizeof(f));
+  f.rms = rms; f.peak = peak; f.p2p = p2p; f.sd = sd; f.fs = fs;
+  float df = fs / N_SAMP;
+  int kmin = (int)ceilf(1.0f / df); if (kmin < 2) kmin = 2;
+  int kb = -1; float best = 0;
+  for (int k = kmin; k < N_BINS; k++) if (A[k] > best) { best = A[k]; kb = k; }
+  if (kb < 0 || best <= 0) f.domF = NAN;
+  else {
+    float fr = (float)kb;
+    if (kb > kmin && kb < N_BINS - 1) {
+      float a = A[kb - 1], b = A[kb], c = A[kb + 1], den = a - 2 * b + c;
+      if (fabsf(den) > 1e-12f) { float d = 0.5f * (a - c) / den; if (d > -1 && d < 1) fr += d; }
+    }
+    f.domF = fr * df;
+  }
+  float e[N_BANDS] = {0, 0, 0, 0}, tot = 0;
+  for (int k = 1; k <= N_BINS; k++) {
+    float p = A[k] * A[k]; tot += p;
+    float fr = k * df; int b = 3;
+    if (fr < BAND_EDGE[0]) b = 0; else if (fr < BAND_EDGE[1]) b = 1; else if (fr < BAND_EDGE[2]) b = 2;
+    e[b] += p;
+  }
+  for (int b = 0; b < N_BANDS; b++) f.band[b] = (tot > 0) ? e[b] / tot : NAN;
+  float s[N_SPEC], mx = 0;
+  for (int j = 0; j < N_SPEC; j++) { float a = A[2 * j], b = A[2 * j + 1]; s[j] = sqrtf(0.5f * (a * a + b * b)); if (s[j] > mx) mx = s[j]; }
+  f.specMax = mx;
+  for (int j = 0; j < N_SPEC; j++) f.spec[j] = (mx > 0) ? (uint8_t)lroundf(s[j] / mx * 255.0f) : 0;
+}
+
+// ---- similarity ----
+float relDev(float a, float b) {
+  if (!isfinite(a) || !isfinite(b)) return NAN;
+  float den = fmaxf(fmaxf(a, b), NOISE_FLOOR);
+  return fminf(1.0f, fabsf(a - b) / den);
+}
+bool compareFeat(const Feat& c, const Feat& b, float& score, float* dev) {
+  for (int i = 0; i < 5; i++) dev[i] = NAN;
+  score = NAN;
+  if (!(b.fs > 0) || !(c.fs > 0) || fabsf(c.fs - b.fs) / b.fs > 0.15f) return false;
+  dev[0] = relDev(c.rms, b.rms);
+  dev[1] = relDev(c.peak, b.peak);
+  if (isfinite(c.domF) && isfinite(b.domF) && b.domF > 0) dev[2] = fminf(1.0f, fabsf(c.domF - b.domF) / fmaxf(b.domF, 5.0f));
+  float sa = 0, ss = 0;
+  for (int j = 0; j < N_SPEC; j++) { float x = specAt(c, j), y = specAt(b, j); sa += fabsf(x - y); ss += x + y; }
+  if (ss > 0) dev[3] = fminf(1.0f, sa / ss);
+  bool okb = true; float sb = 0;
+  for (int i = 0; i < N_BANDS; i++) { if (!isfinite(c.band[i]) || !isfinite(b.band[i])) { okb = false; break; } sb += fabsf(c.band[i] - b.band[i]); }
+  if (okb) dev[4] = fminf(1.0f, 0.5f * sb);
+  float sw = 0, sd = 0;
+  for (int i = 0; i < 5; i++) if (isfinite(dev[i])) { sw += W_FEAT[i]; sd += W_FEAT[i] * dev[i]; }
+  if (sw <= 0) return false;
+  float s = 100.0f * (1.0f - sd / sw);
+  if (s < 0) s = 0; if (s > 100) s = 100;
+  score = s;
+  return true;
+}
+
+void clearResult() { memset(&cur, 0, sizeof(cur)); haveWin = false; }
+
+void makeInvalid(uint16_t flags) {
+  memset(&cur, 0, sizeof(cur));
+  cur.winId = ++winCounter; cur.measId = nextMeasId; cur.ts = epochNow();
+  cur.quality = Q_INVALID; cur.flags = flags; cur.state = 3;
+  cur.f.rms = cur.f.peak = cur.f.p2p = cur.f.sd = cur.f.domF = cur.f.fs = NAN;
+  for (int b = 0; b < N_BANDS; b++) cur.f.band[b] = NAN;
+  for (int i = 0; i < 5; i++) cur.dev[i] = NAN;
+  cur.fsEff = NAN; cur.gmag = NAN;
+}
+
+void processWindow() {
+  const float K = ACC_LSB_MS2;
+  float mean[3] = {0, 0, 0};
+  int16_t rmn[3] = {32767, 32767, 32767}, rmx[3] = {-32768, -32768, -32768};
+  for (int a = 0; a < 3; a++) {
+    for (int i = 0; i < N_SAMP; i++) { int16_t v = rawBuf[a][i]; mean[a] += v; if (v < rmn[a]) rmn[a] = v; if (v > rmx[a]) rmx[a] = v; }
+    mean[a] /= N_SAMP;
+  }
+  bool stuck = (rmn[0] == rmx[0] && rmn[1] == rmx[1] && rmn[2] == rmx[2]);
+  float* dst[3] = {wx, wy, wz};
+  float axSq[3] = {0, 0, 0}, mn[3] = {1e9f, 1e9f, 1e9f}, mx[3] = {-1e9f, -1e9f, -1e9f};
+  float sumSq = 0, sumRes = 0, peak = 0;
+  for (int i = 0; i < N_SAMP; i++) {
+    float d[3];
+    for (int a = 0; a < 3; a++) {
+      d[a] = ((float)rawBuf[a][i] - mean[a]) * K;       // DC / gravity / bias removed
+      dst[a][i] = d[a]; axSq[a] += d[a] * d[a];
+      if (d[a] < mn[a]) mn[a] = d[a]; if (d[a] > mx[a]) mx[a] = d[a];
+    }
+    float r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2], r = sqrtf(r2);
+    sumSq += r2; sumRes += r; if (r > peak) peak = r;
+  }
+  float rms = sqrtf(sumSq / N_SAMP), mr = sumRes / N_SAMP;
+  float var = sumSq / N_SAMP - mr * mr, sd = var > 0 ? sqrtf(var) : 0;
+  float p2p = 0;
+  for (int a = 0; a < 3; a++) { cur.axRms[a] = sqrtf(axSq[a] / N_SAMP); cur.axP2p[a] = mx[a] - mn[a]; if (cur.axP2p[a] > p2p) p2p = cur.axP2p[a]; }
+  float gmag = K * sqrtf(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]);
+
+  // FFT per axis (Hamming), combined vector amplitude spectrum
+  float P[N_BINS + 1];
+  for (int k = 0; k <= N_BINS; k++) P[k] = 0;
+  for (int a = 0; a < 3; a++) {
+    for (int i = 0; i < N_SAMP; i++) { fre[i] = dst[a][i] * hw[i]; fim[i] = 0; }
+    fft(fre, fim);
+    for (int k = 0; k <= N_BINS; k++) P[k] += fre[k] * fre[k] + fim[k] * fim[k];
+  }
+  for (int k = 0; k <= N_BINS; k++) curA[k] = (k == 0) ? 0 : 2.0f * sqrtf(P[k]) / hwSum;
+
+  // timing from exact FIFO counts
+  float dt = (float)(uint32_t)(acqLastT - acqT0) * 1e-6f;
+  float fsEff = (dt > 0) ? (float)acqTotal / dt : NAN;
+  bool irreg = false;
+  if (acqMidTotal > 0 && acqMidT > acqT0 && acqLastT > acqMidT && acqTotal > acqMidTotal + 20 && isfinite(fsEff)) {
+    float f1 = acqMidTotal / ((float)(acqMidT - acqT0) * 1e-6f);
+    float f2 = (acqTotal - acqMidTotal) / ((float)(acqLastT - acqMidT) * 1e-6f);
+    if (fabsf(f1 - f2) / fsEff > 0.15f) irreg = true;
+  }
+  float tdev = isfinite(fsEff) ? fabsf(fsEff - FS_NOMINAL) / FS_NOMINAL : 9.0f;
+
+  uint16_t fl = 0;
+  if (acqOverrun) fl |= F_OVERRUN;
+  if (acqClip > 0) fl |= F_CLIP;
+  if (tdev > 0.05f) fl |= F_TIMING;
+  if (irreg) fl |= F_IRREG;
+  if (rms < LOWSIG_RMS) fl |= F_LOWSIG;
+  if (gmag < 7.5f || gmag > 12.3f) fl |= F_GRAV;
+  if (stuck) fl |= F_STUCK;
+  uint8_t q = Q_GOOD;
+  if (fl & (F_LOWSIG | F_GRAV | F_TIMING)) q = Q_ACCEPTABLE;
+  if (tdev > 0.12f || irreg || acqClip > 0) q = Q_POOR;
+  if (stuck || acqOverrun || tdev > 0.30f || acqClip > N_SAMP / 20 || !isfinite(fsEff)) q = Q_INVALID;
+
+  cur.winId = ++winCounter; cur.measId = nextMeasId; cur.ts = epochNow();
+  cur.quality = q; cur.flags = fl; cur.clip = acqClip; cur.fsEff = fsEff; cur.gmag = gmag;
+  buildFeat(cur.f, curA, rms, peak, p2p, sd, isfinite(fsEff) ? fsEff : FS_NOMINAL);
+  cur.hasScore = false; cur.score = NAN; cur.baseId = 0;
+  for (int i = 0; i < 5; i++) cur.dev[i] = NAN;
+  if (q == Q_INVALID) cur.state = 3;
+  else if (mode == M_BASELINE) cur.state = 2;
+  else if (activeObj < 0 || !baseValid[activeObj]) cur.state = 2;
+  else {
+    float sc;
+    cur.baseId = baseCache[activeObj].id;
+    if (compareFeat(cur.f, baseCache[activeObj].f, sc, cur.dev)) { cur.hasScore = true; cur.score = sc; cur.state = 1; }
+    else cur.state = 4;
+  }
+  dataWin = cur.winId; haveWin = true;
+}
+
+// ============================ BASELINE ============================
+void blReset() {
+  blAccepted = 0; blRejected = 0;
+  for (int i = 0; i < 5; i++) blSum[i] = 0;
+  for (int k = 0; k <= N_BINS; k++) blSumA[k] = 0;
+}
+bool finalizeBaseline() {
+  mode = M_IDLE; acqActive = false;
+  if (blAccepted < BL_MIN_WIN) {
+    blPhase = BL_IDLE; blCandValid = false;
+    blMsg = "Incomplete baseline rejected: " + String(blAccepted) + " valid window(s) recorded, minimum is " + String(BL_MIN_WIN) + ".";
+    return false;
+  }
+  float n = blAccepted, A[N_BINS + 1];
+  for (int k = 0; k <= N_BINS; k++) A[k] = blSumA[k] / n;
+  memset(&blCand, 0, sizeof(blCand));
+  blCand.magic = MAGIC_BASE; blCand.id = nextBaseId; blCand.ts = epochNow(); blCand.windows = blAccepted;
+  buildFeat(blCand.f, A, blSum[0] / n, blSum[1] / n, blSum[2] / n, blSum[3] / n, blSum[4] / n);
+  if (!(blCand.f.rms > 0) || !(blCand.f.fs > 0)) {
+    blPhase = BL_IDLE; blCandValid = false; blMsg = "Baseline rejected: no usable vibration signal."; return false;
+  }
+  blCandValid = true; blPhase = BL_REVIEW; blMsg = "Baseline recorded. Review it, then save or re-record.";
+  return true;
+}
+void baselineWindowDone() {
+  if (cur.quality >= Q_ACCEPTABLE) {
+    blSum[0] += cur.f.rms; blSum[1] += cur.f.peak; blSum[2] += cur.f.p2p; blSum[3] += cur.f.sd; blSum[4] += cur.f.fs;
+    for (int k = 0; k <= N_BINS; k++) blSumA[k] += curA[k];
+    blAccepted++;
+  } else blRejected++;
+  if (blAccepted >= BL_MAX_WIN) finalizeBaseline();
+  else if (blRejected >= BL_MAX_REJECT) {
+    mode = M_IDLE; blPhase = BL_IDLE; blCandValid = false;
+    blMsg = "Baseline aborted: too many invalid windows. Check mounting, wiring and excitation.";
+  }
+}
+void finishWindow() {
+  acqActive = false;
+  if (acqErr || acqCount < N_SAMP) makeInvalid(acqErr ? F_SENSOR : F_SHORT);
+  else processWindow();
+  if (mode == M_BASELINE) baselineWindowDone();
+}
+
+// ============================ STORAGE ============================
+bool saveMeasurement(uint32_t& idOut, String& err) {
+  if (!storageOk) { err = "Storage unavailable"; return false; }
+  if (activeObj < 0) { err = "No object selected"; return false; }
+  if (cur.winId <= testStartWin || cur.quality == Q_INVALID || !isfinite(cur.f.rms)) { err = "No valid completed measurement to save"; return false; }
+  int slot = -1, oldestSlot = 0; uint32_t oldest = 0xFFFFFFFFUL;
+  for (int i = 0; i < MAX_HIST; i++) {
+    if (!histValid[i]) { slot = i; break; }
+    if (hist[i].id < oldest) { oldest = hist[i].id; oldestSlot = i; }
+  }
+  if (slot < 0) slot = oldestSlot;
+  MeasRec m; memset(&m, 0, sizeof(m));
+  m.magic = MAGIC_MEAS; m.id = nextMeasId; m.ts = cur.ts; m.baseId = cur.baseId;
+  m.score = cur.hasScore ? cur.score : NAN; m.hasScore = cur.hasScore;
+  for (int i = 0; i < 5; i++) m.dev[i] = cur.dev[i];
+  m.quality = cur.quality; m.obj = (uint8_t)activeObj; m.flags = cur.flags; m.clip = cur.clip; m.samples = N_SAMP; m.f = cur.f;
+  char key[8]; snprintf(key, sizeof(key), "m%d", slot);
+  if (prefs.putBytes(key, &m, sizeof(m)) != sizeof(m)) { err = "Flash write failed"; return false; }
+  hist[slot] = m; histValid[slot] = true; idOut = m.id;
+  nextMeasId++; prefs.putUInt("nmid", nextMeasId);
+  cur.measId = nextMeasId;
+  return true;
+}
+String objGet(int slot, int idx) {
+  const String& p = objPack[slot];
+  int start = 0;
+  for (int i = 0; i < idx; i++) { int q = p.indexOf((char)0x1F, start); if (q < 0) return ""; start = q + 1; }
+  int e = p.indexOf((char)0x1F, start);
+  return e < 0 ? p.substring(start) : p.substring(start, e);
+}
+void purgeObject(int slot) {
+  char key[8];
+  snprintf(key, sizeof(key), "o%d", slot); prefs.remove(key);
+  snprintf(key, sizeof(key), "b%d", slot); prefs.remove(key);
+  objPack[slot] = ""; objUsed[slot] = false; baseValid[slot] = false;
+  for (int h = 0; h < MAX_HIST; h++) if (histValid[h] && hist[h].obj == slot) {
+    snprintf(key, sizeof(key), "m%d", h); prefs.remove(key); histValid[h] = false;
+  }
+  if (activeObj == slot) {
+    activeObj = -1;
+    for (int i = 0; i < MAX_OBJ; i++) if (objUsed[i]) { activeObj = i; break; }
+    prefs.putChar("act", activeObj);
+  }
+  clearResult();
+}
+void loadStorage() {
+  for (int i = 0; i < MAX_OBJ; i++) { objUsed[i] = false; baseValid[i] = false; }
+  for (int i = 0; i < MAX_HIST; i++) histValid[i] = false;
+  storageOk = prefs.begin("shm", false);
+  if (!storageOk) { Serial.println("[NVS] open failed"); return; }
+  nextMeasId = prefs.getUInt("nmid", 1); nextBaseId = prefs.getUInt("nbid", 1);
+  activeObj = prefs.getChar("act", -1);
+  char key[8];
+  for (int i = 0; i < MAX_OBJ; i++) {
+    snprintf(key, sizeof(key), "o%d", i);
+    if (prefs.isKey(key)) { objPack[i] = prefs.getString(key, ""); objUsed[i] = objPack[i].length() > 0; }
+  }
+  for (int i = 0; i < MAX_OBJ; i++) {
+    snprintf(key, sizeof(key), "b%d", i);
+    if (prefs.isKey(key) && prefs.getBytesLength(key) == sizeof(BaseRec)) {
+      prefs.getBytes(key, &baseCache[i], sizeof(BaseRec));
+      baseValid[i] = (baseCache[i].magic == MAGIC_BASE) && objUsed[i];
+    }
+  }
+  for (int i = 0; i < MAX_HIST; i++) {
+    snprintf(key, sizeof(key), "m%d", i);
+    if (prefs.isKey(key) && prefs.getBytesLength(key) == sizeof(MeasRec)) {
+      prefs.getBytes(key, &hist[i], sizeof(MeasRec));
+      histValid[i] = (hist[i].magic == MAGIC_MEAS) && hist[i].obj < MAX_OBJ && objUsed[hist[i].obj];
+    }
+  }
+  if (activeObj < 0 || activeObj >= MAX_OBJ || !objUsed[activeObj]) {
+    activeObj = -1;
+    for (int i = 0; i < MAX_OBJ; i++) if (objUsed[i]) { activeObj = i; break; }
+  }
+  Serial.printf("[NVS] loaded: objects/baselines/measurements restored, active=%d\n", activeObj);
+}
+
+// ============================ JSON BUILDERS ============================
+String featJson(const Feat& f, bool withSpec) {
+  String s; s.reserve(withSpec ? 700 : 260);
+  s += "{\"rms\":" + jnum(f.rms, 4) + ",\"peak\":" + jnum(f.peak, 4) + ",\"p2p\":" + jnum(f.p2p, 4) +
+       ",\"sd\":" + jnum(f.sd, 4) + ",\"domF\":" + jnum(f.domF, 2) + ",\"fs\":" + jnum(f.fs, 2) + ",\"band\":[";
+  for (int b = 0; b < N_BANDS; b++) { s += jnum(f.band[b], 4); if (b < N_BANDS - 1) s += ","; }
+  s += "]";
+  if (withSpec) {
+    s += ",\"spec\":[";
+    for (int j = 0; j < N_SPEC; j++) { s += jnum(specAt(f, j), 4); if (j < N_SPEC - 1) s += ","; }
+    s += "]";
+  }
+  return s + "}";
+}
+String devJson(const float* dev) {
+  String s = "[";
+  for (int i = 0; i < 5; i++) {
+    s += "{\"n\":" + jstr(FEAT_NAMES[i]) + ",\"d\":" + jnum(dev[i], 4) + ",\"w\":" + jnum(W_FEAT[i], 2) + "}";
+    if (i < 4) s += ",";
+  }
+  return s + "]";
+}
+String resultJson() {
+  if (cur.winId == 0) return "null";
+  String s; s.reserve(1000);
+  s += "{\"win\":" + U(cur.winId) + ",\"meas\":" + U(cur.measId) + ",\"ts\":" + U(cur.ts) +
+       ",\"quality\":" + jstr(qName(cur.quality)) + ",\"issues\":" + issuesJson(cur.flags) +
+       ",\"state\":" + jstr(stateName(cur.state)) +
+       ",\"score\":" + (cur.hasScore ? jnum(cur.score, 1) : String("null")) +
+       ",\"cat\":" + (cur.hasScore ? jstr(scoreCat(cur.score)) : String("null")) +
+       ",\"baseId\":" + U(cur.baseId) + ",\"dev\":" + devJson(cur.dev) +
+       ",\"rms\":" + jnum(cur.f.rms, 4) + ",\"peak\":" + jnum(cur.f.peak, 4) + ",\"p2p\":" + jnum(cur.f.p2p, 4) +
+       ",\"sd\":" + jnum(cur.f.sd, 4) + ",\"domF\":" + jnum(cur.f.domF, 2) + ",\"fs\":" + jnum(cur.fsEff, 2) +
+       ",\"dur\":" + jnum(isfinite(cur.fsEff) && cur.fsEff > 0 ? N_SAMP / cur.fsEff : NAN, 3) +
+       ",\"n\":" + String(N_SAMP) + ",\"clip\":" + U(cur.clip) + ",\"gmag\":" + jnum(cur.gmag, 2) + "}";
+  return s;
+}
+String objectBrief(int slot) {
+  return "{\"slot\":" + String(slot) + ",\"name\":" + jstr(objGet(slot, 0)) + ",\"oid\":" + jstr(objGet(slot, 1)) +
+         ",\"hasBaseline\":" + jbool(baseValid[slot]) + ",\"baseId\":" + U(baseValid[slot] ? baseCache[slot].id : 0) +
+         ",\"baseTs\":" + U(baseValid[slot] ? baseCache[slot].ts : 0) + "}";
+}
+String baseJson(const BaseRec& b) {
+  return "{\"id\":" + U(b.id) + ",\"ts\":" + U(b.ts) + ",\"windows\":" + U(b.windows) + ",\"f\":" + featJson(b.f, true) + "}";
+}
+
+// ============================ HTTP HANDLERS ============================
+extern const char HTML_A[] PROGMEM;
+extern const char HTML_B[] PROGMEM;
+extern const char HTML_C[] PROGMEM;
+
+void sendPgm(const char* p) {
+  size_t len = strlen_P(p), off = 0;
+  while (off < len) {
+    size_t n = len - off; if (n > 1400) n = 1400;
+    server.sendContent_P(p + off, n);
+    off += n;
+    acqPoll();                       // keep draining the ADXL345 FIFO while serving the page
+  }
+}
+void handleRoot() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send(200, "text/html", "");
+  sendPgm(HTML_A); sendPgm(HTML_B); sendPgm(HTML_C);
+  server.sendContent("");
+}
+void handleStatus() {
+  if (server.hasArg("t")) {
+    uint32_t t = strtoul(server.arg("t").c_str(), NULL, 10);
+    if (t > 1500000000UL) {
+      uint32_t e = epochNow();
+      if (!timeSynced || (t > e ? t - e : e - t) > 2) { epochBase = t; epochSyncMs = millis(); timeSynced = true; }
+    }
+  }
+  String s; s.reserve(1800);
+  s += "{\"ok\":true,\"uptime\":" + U(millis() / 1000) + ",\"ts\":" + U(epochNow()) + ",\"storage\":" + jbool(storageOk);
+  s += ",\"wifi\":{\"ssid\":" + jstr(AP_SSID) + ",\"ip\":" + jstr(WiFi.softAPIP().toString()) + ",\"clients\":" + String(WiFi.softAPgetStationNum()) + "}";
+  s += ",\"sensor\":{\"ok\":" + jbool(sensorOk) + ",\"model\":\"ADXL345\",\"addr\":\"0x53\",\"odr\":" + String((int)FS_NOMINAL) + ",\"range\":4,\"errors\":" + U(sensorErrors) + "}";
+  s += ",\"mode\":" + String(mode == M_TEST ? "\"test\"" : mode == M_BASELINE ? "\"baseline\"" : "\"idle\"");
+  s += ",\"phase\":" + String(blPhase == BL_REC ? "\"recording\"" : blPhase == BL_REVIEW ? "\"review\"" : "\"idle\"");
+  s += ",\"acq\":{\"count\":" + U(acqActive ? acqCount : 0) + ",\"n\":" + String(N_SAMP) + "}";
+  s += ",\"bl\":{\"accepted\":" + String(blAccepted) + ",\"rejected\":" + String(blRejected) + ",\"min\":" + String(BL_MIN_WIN) + ",\"max\":" + String(BL_MAX_WIN) + ",\"msg\":" + jstr(blMsg) + "}";
+  s += ",\"object\":" + ((activeObj >= 0 && objUsed[activeObj]) ? objectBrief(activeObj) : String("null"));
+  s += ",\"motor\":{\"state\":\"DISABLED\",\"rpm\":\"NOT MEASURED\",\"current\":\"NOT MEASURED\"}";
+  s += ",\"result\":" + resultJson() + "}";
+  sendJson(200, s);
+}
+void handleSensor() {
+  bool conn = sensorOk && haveLast;
+  String s = "{\"ok\":true,\"connected\":" + jbool(sensorOk) + ",\"errors\":" + U(sensorErrors);
+  if (conn) {
+    float x = lastRaw[0] * ACC_LSB_MS2, y = lastRaw[1] * ACC_LSB_MS2, z = lastRaw[2] * ACC_LSB_MS2;
+    s += ",\"x\":" + jnum(x, 3) + ",\"y\":" + jnum(y, 3) + ",\"z\":" + jnum(z, 3) +
+         ",\"mag\":" + jnum(sqrtf(x * x + y * y + z * z), 3) + ",\"age\":" + U(millis() - lastSampleMs);
+  } else s += ",\"x\":null,\"y\":null,\"z\":null,\"mag\":null,\"age\":null";
+  sendJson(200, s + "}");
+}
+void handleData() {
+  if (!haveWin) { sendJson(200, "{\"ok\":true,\"has\":false}"); return; }
+  long since = server.hasArg("since") ? server.arg("since").toInt() : -1;
+  if (since == (long)dataWin) { sendJson(200, "{\"ok\":true,\"has\":true,\"changed\":false,\"win\":" + U(dataWin) + "}"); return; }
+  float fs = (isfinite(cur.fsEff) && cur.fsEff > 0) ? cur.fsEff : FS_NOMINAL;
+  String s; s.reserve(11000);
+  s += "{\"ok\":true,\"has\":true,\"changed\":true,\"win\":" + U(dataWin) + ",\"fs\":" + jnum(fs, 2) + ",\"df\":" + jnum(fs / N_SAMP, 4) +
+       ",\"n\":" + String(N_SAMP) + ",\"quality\":" + jstr(qName(cur.quality));
+  const float* arr[3] = {wx, wy, wz}; const char* nm[3] = {"x", "y", "z"};
+  for (int a = 0; a < 3; a++) {
+    s += ",\"" + String(nm[a]) + "\":[";
+    for (int i = 0; i < N_SAMP; i++) { s += String(arr[a][i], 3); if (i < N_SAMP - 1) s += ","; }
+    s += "]";
+  }
+  s += ",\"spec\":[";
+  for (int k = 0; k <= N_BINS; k++) { s += String(curA[k], 4); if (k < N_BINS) s += ","; }
+  s += "],\"cur64\":[";
+  for (int j = 0; j < N_SPEC; j++) { s += jnum(specAt(cur.f, j), 4); if (j < N_SPEC - 1) s += ","; }
+  s += "],\"f\":" + featJson(cur.f, false);
+  s += ",\"ax\":{\"rms\":[" + jnum(cur.axRms[0], 4) + "," + jnum(cur.axRms[1], 4) + "," + jnum(cur.axRms[2], 4) +
+       "],\"p2p\":[" + jnum(cur.axP2p[0], 4) + "," + jnum(cur.axP2p[1], 4) + "," + jnum(cur.axP2p[2], 4) + "]}";
+  if (activeObj >= 0 && baseValid[activeObj]) {
+    const Feat& bf = baseCache[activeObj].f;
+    s += ",\"base\":" + featJson(bf, false) + ",\"base64\":[";
+    for (int j = 0; j < N_SPEC; j++) { s += jnum(specAt(bf, j), 4); if (j < N_SPEC - 1) s += ","; }
+    s += "]";
+  } else s += ",\"base\":null,\"base64\":null";
+  s += "}";
+  sendJson(200, s);
+}
+void handleBaselineGet() {
+  String s; s.reserve(2500);
+  s += "{\"ok\":true,\"phase\":" + String(blPhase == BL_REC ? "\"recording\"" : blPhase == BL_REVIEW ? "\"review\"" : "\"idle\"");
+  s += ",\"msg\":" + jstr(blMsg);
+  s += ",\"progress\":{\"accepted\":" + String(blAccepted) + ",\"rejected\":" + String(blRejected) + ",\"min\":" + String(BL_MIN_WIN) +
+       ",\"max\":" + String(BL_MAX_WIN) + ",\"count\":" + U(acqActive ? acqCount : 0) + ",\"n\":" + String(N_SAMP) + "}";
+  s += ",\"active\":" + String((int)activeObj) + ",\"objects\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_OBJ; i++) if (objUsed[i]) { if (!first) s += ","; s += objectBrief(i); first = false; }
+  s += "],\"saved\":" + ((activeObj >= 0 && baseValid[activeObj]) ? baseJson(baseCache[activeObj]) : String("null"));
+  s += ",\"candidate\":" + ((blPhase == BL_REVIEW && blCandValid) ? baseJson(blCand) : String("null")) + "}";
+  sendJson(200, s);
+}
+void handleTestStart() {
+  if (mode != M_IDLE) { sendErr(409, mode == M_TEST ? "Test already running" : "Baseline recording in progress - stop it first"); return; }
+  if (activeObj < 0 || !objUsed[activeObj]) { sendErr(409, "Create/select an object profile first"); return; }
+  if (!sensorOk) { sendErr(503, "ADXL345 not detected - check wiring"); return; }
+  testStartWin = winCounter;
+  if (!acqStart()) { sendErr(503, "Could not start acquisition - sensor error"); return; }
+  mode = M_TEST;
+  sendOk();
+}
+void handleTestStop() {
+  if (mode != M_TEST) { sendErr(409, "No test running"); return; }
+  acqActive = false; mode = M_IDLE;
+  uint32_t id = 0; String err;
+  if (saveMeasurement(id, err)) sendOk(",\"saved\":true,\"id\":" + U(id));
+  else sendOk(",\"saved\":false,\"reason\":" + jstr(err));
+}
+void handleBaselineStart() {
+  if (mode == M_TEST) { sendErr(409, "Stop the running test first"); return; }
+  if (activeObj < 0 || !objUsed[activeObj]) { sendErr(409, "Create/select an object profile first"); return; }
+  if (!sensorOk) { sendErr(503, "ADXL345 not detected - check wiring"); return; }
+  blReset(); blCandValid = false; blObj = activeObj; blMsg = "Recording baseline - excite the object consistently.";
+  if (!acqStart()) { sendErr(503, "Could not start acquisition - sensor error"); return; }
+  mode = M_BASELINE; blPhase = BL_REC; clearResult();
+  sendOk();
+}
+void handleBaselineStop() {
+  bool cancel = server.arg("cancel") == "1";
+  if (blPhase == BL_REC) {
+    if (cancel) { mode = M_IDLE; acqActive = false; blPhase = BL_IDLE; blCandValid = false; blMsg = "Baseline recording cancelled."; sendOk(); return; }
+    bool ok = finalizeBaseline();
+    if (!ok) { sendErr(422, blMsg); return; }
+    sendOk(); return;
+  }
+  if (blPhase == BL_REVIEW && cancel) { blPhase = BL_IDLE; blCandValid = false; blMsg = "Baseline discarded."; sendOk(); return; }
+  sendErr(409, "No baseline recording in progress");
+}
+void handleBaselineSave() {
+  if (blPhase != BL_REVIEW || !blCandValid) { sendErr(409, "No reviewed baseline to save"); return; }
+  if (!storageOk) { sendErr(500, "Storage unavailable"); return; }
+  if (blObj < 0 || !objUsed[blObj]) { sendErr(409, "Object no longer exists"); return; }
+  char key[8]; snprintf(key, sizeof(key), "b%d", blObj);
+  if (prefs.putBytes(key, &blCand, sizeof(BaseRec)) != sizeof(BaseRec)) { sendErr(500, "Flash write failed - baseline not saved"); return; }
+  baseCache[blObj] = blCand; baseValid[blObj] = true;
+  nextBaseId++; prefs.putUInt("nbid", nextBaseId);
+  blPhase = BL_IDLE; blCandValid = false; blMsg = "Baseline saved."; clearResult();
+  sendOk();
+}
+void handleObjectGet() {
+  String s; s.reserve(2500);
+  s += "{\"ok\":true,\"active\":" + String((int)activeObj) + ",\"max\":" + String(MAX_OBJ) + ",\"objects\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_OBJ; i++) if (objUsed[i]) {
+    if (!first) s += ","; first = false;
+    s += "{\"slot\":" + String(i) + ",\"hasBaseline\":" + jbool(baseValid[i]) + ",\"baseId\":" + U(baseValid[i] ? baseCache[i].id : 0) + ",\"f\":{";
+    for (int k = 0; k < 17; k++) { s += "\"" + String(OBJ_FIELDS[k]) + "\":" + jstr(objGet(i, k)); if (k < 16) s += ","; }
+    s += "}}";
+  }
+  sendJson(200, s + "]}");
+}
+String cleanVal(String v) {
+  v.trim();
+  for (size_t i = 0; i < v.length(); i++) if ((uint8_t)v[i] < 0x20) v.setCharAt(i, ' ');
+  if (v.length() > 64) v = v.substring(0, 64);
+  return v;
+}
+void handleObjectSave() {
+  if (!storageOk) { sendErr(500, "Storage unavailable"); return; }
+  String vals[17];
+  for (int i = 0; i < 17; i++) vals[i] = cleanVal(server.arg(OBJ_FIELDS[i]));
+  if (vals[0].length() == 0 || vals[1].length() == 0) { sendErr(400, "Object name and Object ID are required"); return; }
+  const int numIdx[4] = {3, 4, 5, 7};
+  for (int n = 0; n < 4; n++) {
+    int i = numIdx[n];
+    if (vals[i].length()) {
+      char* e; double d = strtod(vals[i].c_str(), &e);
+      if (*e != 0 || !isfinite(d) || d < 0 || d > 1000000.0) { sendErr(400, String(OBJ_FIELDS[i]) + " must be a non-negative number"); return; }
+    }
+  }
+  bool matOk = false;
+  for (int m = 0; m < 7; m++) if (vals[6] == MATERIALS[m]) matOk = true;
+  if (!matOk) { sendErr(400, "Select a valid material"); return; }
+  int slot = -1;
+  if (server.hasArg("slot") && server.arg("slot").length()) slot = server.arg("slot").toInt();
+  if (slot < -1 || slot >= MAX_OBJ) { sendErr(400, "Invalid slot"); return; }
+  if (slot >= 0 && !objUsed[slot]) { sendErr(404, "Unknown profile slot"); return; }
+  if (slot < 0) {
+    for (int i = 0; i < MAX_OBJ; i++) if (!objUsed[i]) { slot = i; break; }
+    if (slot < 0) { sendErr(409, "Object storage full (max " + String(MAX_OBJ) + "). Delete a profile first."); return; }
+  }
+  String packed;
+  for (int i = 0; i < 17; i++) { packed += vals[i]; if (i < 16) packed += (char)0x1F; }
+  char key[8]; snprintf(key, sizeof(key), "o%d", slot);
+  if (prefs.putString(key, packed) == 0) { sendErr(500, "Flash write failed - profile not saved"); return; }
+  objPack[slot] = packed; objUsed[slot] = true;
+  if (activeObj < 0) { activeObj = slot; prefs.putChar("act", activeObj); clearResult(); }
+  sendOk(",\"slot\":" + String(slot));
+}
+void handleObjectSelect() {
+  if (mode != M_IDLE || blPhase != BL_IDLE) { sendErr(409, "Finish or cancel the running test/baseline first"); return; }
+  int slot = server.arg("slot").toInt();
+  if (!server.hasArg("slot") || slot < 0 || slot >= MAX_OBJ || !objUsed[slot]) { sendErr(400, "Invalid object slot"); return; }
+  activeObj = slot;
+  if (storageOk) prefs.putChar("act", activeObj);
+  clearResult();
+  sendOk();
+}
+void handleObjectDelete() {
+  if (mode != M_IDLE || blPhase != BL_IDLE) { sendErr(409, "Finish or cancel the running test/baseline first"); return; }
+  int slot = server.arg("slot").toInt();
+  if (!server.hasArg("slot") || slot < 0 || slot >= MAX_OBJ || !objUsed[slot]) { sendErr(400, "Invalid object slot"); return; }
+  purgeObject(slot);
+  sendOk();
+}
+void handleHistory() {
+  if (server.hasArg("id")) {
+    uint32_t id = strtoul(server.arg("id").c_str(), NULL, 10);
+    int h = -1;
+    for (int i = 0; i < MAX_HIST; i++) if (histValid[i] && hist[i].id == id) h = i;
+    if (h < 0) { sendErr(404, "Measurement not found"); return; }
+    const MeasRec& m = hist[h];
+    String s; s.reserve(3000);
+    s += "{\"ok\":true,\"m\":{\"id\":" + U(m.id) + ",\"ts\":" + U(m.ts) + ",\"obj\":" + String(m.obj) + ",\"objName\":" + jstr(objGet(m.obj, 0)) +
+         ",\"quality\":" + jstr(qName(m.quality)) + ",\"issues\":" + issuesJson(m.flags) + ",\"score\":" + (m.hasScore ? jnum(m.score, 1) : String("null")) +
+         ",\"cat\":" + (m.hasScore ? jstr(scoreCat(m.score)) : String("null")) + ",\"baseId\":" + U(m.baseId) + ",\"dev\":" + devJson(m.dev) +
+         ",\"clip\":" + U(m.clip) + ",\"samples\":" + U(m.samples) + ",\"f\":" + featJson(m.f, true) + "}";
+    if (baseValid[m.obj]) {
+      float sc, dev[5];
+      bool ok = compareFeat(m.f, baseCache[m.obj].f, sc, dev) && m.quality != Q_INVALID;
+      s += ",\"baseline\":" + baseJson(baseCache[m.obj]);
+      s += ",\"cmp\":{\"ok\":" + jbool(ok) + ",\"score\":" + (ok ? jnum(sc, 1) : String("null")) + ",\"cat\":" + (ok ? jstr(scoreCat(sc)) : String("null")) +
+           ",\"dev\":" + devJson(ok ? dev : m.dev) + "}";
+    } else s += ",\"baseline\":null,\"cmp\":null";
+    sendJson(200, s + "}");
+    return;
+  }
+  String s; s.reserve(2000);
+  s += "{\"ok\":true,\"max\":" + String(MAX_HIST) + ",\"items\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_HIST; i++) if (histValid[i]) {
+    const MeasRec& m = hist[i];
+    if (!first) s += ","; first = false;
+    s += "{\"id\":" + U(m.id) + ",\"ts\":" + U(m.ts) + ",\"obj\":" + String(m.obj) + ",\"objName\":" + jstr(objGet(m.obj, 0)) +
+         ",\"score\":" + (m.hasScore ? jnum(m.score, 1) : String("null")) + ",\"cat\":" + (m.hasScore ? jstr(scoreCat(m.score)) : String("null")) +
+         ",\"quality\":" + jstr(qName(m.quality)) + ",\"rms\":" + jnum(m.f.rms, 4) + ",\"peak\":" + jnum(m.f.peak, 4) +
+         ",\"domF\":" + jnum(m.f.domF, 2) + ",\"fs\":" + jnum(m.f.fs, 1) + ",\"baseId\":" + U(m.baseId) + "}";
+  }
+  sendJson(200, s + "]}");
+}
+void handleHistoryDelete() {
+  uint32_t id = strtoul(server.arg("id").c_str(), NULL, 10);
+  for (int i = 0; i < MAX_HIST; i++) if (histValid[i] && hist[i].id == id) {
+    char key[8]; snprintf(key, sizeof(key), "m%d", i);
+    if (storageOk) prefs.remove(key);
+    histValid[i] = false;
+    sendOk(); return;
+  }
+  sendErr(404, "Measurement not found");
+}
+String csvq(const String& v) { String o = "\""; for (size_t i = 0; i < v.length(); i++) { if (v[i] == '"') o += "\"\""; else o += v[i]; } return o + "\""; }
+void handleExport() {
+  String s; s.reserve(16000);
+  String fname;
+  if (server.arg("type") == "history") {
+    fname = "history.csv";
+    s += "measurement_id,timestamp_epoch,object_name,baseline_id,similarity_score,category,quality,rms_ms2,peak_ms2,p2p_ms2,std_ms2,dominant_hz,fs_hz,samples,band1,band2,band3,band4\r\n";
+    for (int i = 0; i < MAX_HIST; i++) if (histValid[i]) {
+      const MeasRec& m = hist[i];
+      s += U(m.id) + "," + U(m.ts) + "," + csvq(objGet(m.obj, 0)) + "," + U(m.baseId) + "," + (m.hasScore ? jnum(m.score, 1) : String("")) + "," +
+           (m.hasScore ? scoreCat(m.score) : "") + "," + qName(m.quality) + "," + jnum(m.f.rms, 4) + "," + jnum(m.f.peak, 4) + "," + jnum(m.f.p2p, 4) + "," +
+           jnum(m.f.sd, 4) + "," + jnum(m.f.domF, 2) + "," + jnum(m.f.fs, 2) + "," + U(m.samples);
+      for (int b = 0; b < N_BANDS; b++) s += "," + jnum(m.f.band[b], 4);
+      s += "\r\n";
+    }
+  } else {
+    if (!haveWin) { sendErr(404, "No measurement data available"); return; }
+    float fs = (isfinite(cur.fsEff) && cur.fsEff > 0) ? cur.fsEff : FS_NOMINAL;
+    fname = "window_" + U(dataWin) + ".csv";
+    s += "# window=" + U(dataWin) + " fs_hz=" + String(fs, 2) + " quality=" + qName(cur.quality) + " rms_ms2=" + jnum(cur.f.rms, 4) +
+         " peak_ms2=" + jnum(cur.f.peak, 4) + " dominant_hz=" + jnum(cur.f.domF, 2) + " (acceleration: DC removed, m/s^2)\r\n";
+    s += "sample,time_s,x_ms2,y_ms2,z_ms2,resultant_ms2\r\n";
+    for (int i = 0; i < N_SAMP; i++) {
+      s += String(i) + "," + String(i / fs, 5) + "," + String(wx[i], 4) + "," + String(wy[i], 4) + "," + String(wz[i], 4) + "," +
+           String(sqrtf(wx[i] * wx[i] + wy[i] * wy[i] + wz[i] * wz[i]), 4) + "\r\n";
+    }
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/csv", s);
+}
+void handleNotFound() { sendErr(404, "Not found or wrong HTTP method: " + server.uri()); }
+
+// ============================ WI-FI ============================
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  delay(100);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.setSleep(false);
+  Serial.printf("[WiFi] AP \"%s\" %s, IP %s\n", AP_SSID, ok ? "started" : "FAILED", WiFi.softAPIP().toString().c_str());
+}
+void wifiWatchdog() {
+  static uint32_t t = 0;
+  if (millis() - t < 5000) return;
+  t = millis();
+  if (acqActive) return;
+  wifi_mode_t m = WiFi.getMode();
+  if (m != WIFI_AP && m != WIFI_AP_STA) { Serial.println("[WiFi] AP lost - restarting"); startAP(); }
+}
+
+// ============================ SETUP / LOOP ============================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== STRUCTURAL INTEGRITY MONITOR ===");
+  memset(&cur, 0, sizeof(cur));
+  blReset();
+  dspInit();
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  Wire.setTimeOut(50);
+  loadStorage();
+  sensorOk = adxlInit();
+  Serial.println(sensorOk ? "[ADXL345] detected and configured (200 Hz, FULL_RES +/-4g, FIFO stream)" : "[ADXL345] NOT detected - check wiring (SDA=21 SCL=22 CS=3V3 SDO=GND)");
+  startAP();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/sensor", HTTP_GET, handleSensor);
+  server.on("/api/data", HTTP_GET, handleData);
+  server.on("/api/baseline", HTTP_GET, handleBaselineGet);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.on("/api/object", HTTP_GET, handleObjectGet);
+  server.on("/api/export/csv", HTTP_GET, handleExport);
+  server.on("/api/test/start", HTTP_POST, handleTestStart);
+  server.on("/api/test/stop", HTTP_POST, handleTestStop);
+  server.on("/api/baseline/start", HTTP_POST, handleBaselineStart);
+  server.on("/api/baseline/stop", HTTP_POST, handleBaselineStop);
+  server.on("/api/baseline/save", HTTP_POST, handleBaselineSave);
+  server.on("/api/object/save", HTTP_POST, handleObjectSave);
+  server.on("/api/object/select", HTTP_POST, handleObjectSelect);
+  server.on("/api/object/delete", HTTP_POST, handleObjectDelete);
+  server.on("/api/history/delete", HTTP_POST, handleHistoryDelete);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("[HTTP] Dashboard: http://192.168.4.1");
+}
+
+void loop() {
+  server.handleClient();
+  acqPoll();
+  if (acqActive && (acqDone || acqErr)) finishWindow();
+  if (mode != M_IDLE && !acqActive && sensorOk && millis() - lastAcqTry > 100) {   // next window
+    lastAcqTry = millis();
+    if (!acqStart()) { /* sensor error: sensorIdleService will re-init */ }
+  }
+  sensorIdleService();
+  wifiWatchdog();
+  delay(1);   // 1 ms yield; the 32-sample FIFO (160 ms @200 Hz) buffers data so nothing is lost
+}
+
+// ============================ DASHBOARD (PROGMEM) ============================
+const char HTML_A[] PROGMEM = R"=====(<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Structural Integrity Monitor</title>
+<style>
+:root{--bg:#111820;--bg2:#1A2530;--pn:#222F3B;--bl:#4B607F;--wm:#E8D8C9;--or:#F3701E;--gr:#42A879;--am:#E6B450;--rd:#D95757;--dim:#8a98a8;--ln:#2f3f50}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--wm);font:14px/1.45 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+background-image:linear-gradient(rgba(75,96,127,.10) 1px,transparent 1px),linear-gradient(90deg,rgba(75,96,127,.10) 1px,transparent 1px);background-size:32px 32px}
+.m,.mono,button,th,label small,.k{font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:12px 18px;background:var(--bg2);border-bottom:2px solid var(--or)}
+.brand b{letter-spacing:.12em;font-size:15px}.brand small{display:block;color:var(--dim);font-size:11px;letter-spacing:.08em}
+.pills{display:flex;gap:6px;flex-wrap:wrap}
+.pill{font:600 11px ui-monospace,Consolas,monospace;padding:4px 9px;border:1px solid var(--bl);color:var(--dim);letter-spacing:.06em}
+.pill.ok{border-color:var(--gr);color:var(--gr)}.pill.bad{border-color:var(--rd);color:var(--rd)}.pill.warn{border-color:var(--am);color:var(--am)}
+.banner{padding:8px 18px;background:var(--rd);color:#111820;font:700 12px ui-monospace,Consolas,monospace;letter-spacing:.06em}
+.hide{display:none!important}
+nav{display:flex;gap:0;overflow-x:auto;background:var(--bg2);border-bottom:1px solid var(--ln)}
+nav button{flex:0 0 auto;background:none;border:0;border-bottom:3px solid transparent;color:var(--dim);padding:12px 18px;font-weight:700;font-size:12px;letter-spacing:.1em;cursor:pointer}
+nav button.on{color:var(--wm);border-bottom-color:var(--or);background:var(--pn)}
+main{padding:16px;max-width:1280px;margin:0 auto}
+.grid{display:grid;gap:12px}.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}.g3{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.panel{background:var(--pn);border:1px solid var(--ln);padding:14px;position:relative}
+.panel:before{content:"";position:absolute;left:-1px;top:-1px;width:10px;height:10px;border-left:2px solid var(--or);border-top:2px solid var(--or)}
+.panel h3{margin:0 0 10px;font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.14em;color:var(--dim);text-transform:uppercase}
+.card{background:var(--bg2);border:1px solid var(--ln);padding:10px 12px}
+.card .k{font-size:10px;letter-spacing:.1em;color:var(--dim)}.card .v{font:600 26px ui-monospace,Consolas,monospace;color:var(--wm)}.card .u{font-size:11px;color:var(--dim)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{background:var(--bg2);color:var(--wm);border:1px solid var(--bl);padding:9px 14px;font-weight:700;font-size:12px;letter-spacing:.08em;cursor:pointer;text-transform:uppercase}
+.btn:hover:not(:disabled){border-color:var(--wm)}.btn.pri{background:var(--or);border-color:var(--or);color:#111820}.btn.grn{border-color:var(--gr);color:var(--gr)}
+.btn.dng{border-color:var(--rd);color:var(--rd)}.btn:disabled{opacity:.35;cursor:not-allowed}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}.kv span:nth-child(odd){color:var(--dim);font:11px ui-monospace,Consolas,monospace;letter-spacing:.08em;text-transform:uppercase}
+.note{border-left:3px solid var(--am);background:var(--bg2);padding:8px 10px;font-size:12px;color:var(--wm)}
+.note.info{border-left-color:var(--bl)}.note.bad{border-left-color:var(--rd)}.note.ok{border-left-color:var(--gr)}
+canvas{width:100%;display:block;background:var(--bg2);border:1px solid var(--ln)}
+table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--dim);font-size:10px;letter-spacing:.1em;border-bottom:1px solid var(--bl);padding:6px}
+td{padding:6px;border-bottom:1px solid var(--ln)}tr.sel td{background:var(--bg2)}
+label{display:block;font-size:11px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+input,select{width:100%;background:var(--bg);border:1px solid var(--bl);color:var(--wm);padding:8px;font:13px ui-monospace,Consolas,monospace}
+input:focus,select:focus{outline:1px solid var(--or)}
+.bar{height:10px;background:var(--bg);border:1px solid var(--ln)}.bar i{display:block;height:100%;background:var(--or);width:0}
+.dev{display:grid;grid-template-columns:130px 1fr 48px;gap:8px;align-items:center;margin:5px 0;font-size:12px}
+.toast{position:fixed;right:14px;bottom:14px;background:var(--bg2);border:1px solid var(--or);padding:10px 14px;font-size:13px;z-index:9;max-width:80vw}
+.toast.bad{border-color:var(--rd)}
+.chk{display:inline-flex;gap:5px;align-items:center;font-size:12px;margin:0;color:var(--wm)}.chk input{width:auto}
+@media(max-width:600px){main{padding:10px}.card .v{font-size:22px}.dev{grid-template-columns:90px 1fr 44px}}
+</style></head><body>
+<header><div class="brand"><b>STRUCTURAL INTEGRITY MONITOR</b><small>VIBRATION BASELINE ANALYSIS &middot; ESP32 + ADXL345</small></div>
+<div class="pills"><span id="pEsp" class="pill">ESP32</span><span id="pAdx" class="pill">ADXL345</span><span id="pWifi" class="pill">WI-FI</span><span class="pill bad">MOTOR: DISABLED</span></div></header>
+<div id="offline" class="banner hide">CONNECTION LOST &mdash; reconnect to the "Monitor" Wi-Fi network. Retrying...</div>
+<nav id="tabs"><button data-t="ov" onclick="show('ov')">OVERVIEW</button><button data-t="bl" onclick="show('bl')">BASELINE</button><button data-t="an" onclick="show('an')">SENSOR ANALYSIS</button><button data-t="ob" onclick="show('ob')">OBJECT PROFILE</button><button data-t="hi" onclick="show('hi')">HISTORY</button></nav>
+<main>
+<section id="t-ov" class="tab">
+ <div id="obBanner" class="note info hide" style="margin-bottom:12px"></div>
+ <div class="grid g2">
+  <div class="panel"><h3>System status</h3><div class="kv">
+   <span>ESP32</span><span id="sEsp">--</span><span>ADXL345</span><span id="sAdx">--</span><span>Wi-Fi</span><span id="sWifi">--</span>
+   <span>Object</span><span id="sObj">--</span><span>Measurement</span><span id="sMeas">--</span><span>Last measurement</span><span id="sTs">--</span>
+   <span>Motor</span><span>DISABLED &middot; RPM: NOT MEASURED &middot; Current: NOT MEASURED</span></div>
+   <div class="row" style="margin-top:14px"><button class="btn pri" id="bTest" onclick="startTest()">Start test</button><button class="btn dng" id="bStop" onclick="stopTest()">Stop test</button><button class="btn grn" id="bRec" onclick="recBaseline()">Record baseline</button></div></div>
+  <div class="panel"><h3>Baseline similarity score</h3><canvas id="gauge" style="height:270px"></canvas>
+   <div style="text-align:center"><div id="gCat" class="mono" style="font-weight:700;letter-spacing:.08em"></div><div id="gMeta" class="mono" style="font-size:11px;color:var(--dim)"></div></div>
+   <div class="note info" style="margin-top:8px;font-size:11px">Experimental vibration-response similarity to the recorded baseline. NOT a certified structural integrity or safety rating.</div></div>
+ </div>
+ <div class="grid g3" id="metrics" style="margin-top:12px"></div>
+ <div class="grid g2" style="margin-top:12px"><div class="panel"><h3>Main deviations from baseline</h3><div id="devList" style="color:var(--dim)">--</div></div>
+ <div class="panel"><h3>Data quality</h3><div id="qList" style="color:var(--dim)">--</div></div></div>
+</section>
+<section id="t-bl" class="tab hide">
+ <div class="grid g2">
+  <div class="panel"><h3>Baseline recording</h3>
+   <label>Object under test</label><select id="blObj" onchange="selObj(this.value)"></select>
+   <ol style="font-size:12px;color:var(--dim);padding-left:18px"><li>Select or create an object (Object Profile tab).</li><li>Mount the ADXL345 the same way every time.</li><li>Press Start and excite the object repeatedly (e.g. gentle taps) for several seconds.</li><li>Stop (or wait for 10 windows), review, then Save.</li></ol>
+   <div class="row"><button class="btn pri" id="bBlStart" onclick="blStart()">Start recording</button><button class="btn" id="bBlStop" onclick="blStop()">Stop recording</button><button class="btn grn" id="bBlSave" onclick="blSave()">Save baseline</button><button class="btn" id="bBlRe" onclick="blStart()">Re-record</button><button class="btn dng" id="bBlCancel" onclick="blCancel()">Cancel</button></div>
+   <div style="margin-top:12px"><div class="bar"><i id="blBar"></i></div><div id="blProg" class="mono" style="font-size:11px;color:var(--dim);margin-top:4px">--</div></div>
+   <div id="blMsg" class="note info" style="margin-top:10px"></div></div>
+  <div class="panel"><h3>Baseline spectrum (saved vs candidate)</h3><canvas id="bc" style="height:240px"></canvas></div>
+  <div class="panel"><h3>Candidate baseline (review)</h3><div id="blCand" style="color:var(--dim)">No candidate.</div></div>
+  <div class="panel"><h3>Saved baseline</h3><div id="blSaved" style="color:var(--dim)">None saved for this object.</div></div>
+ </div>
+</section>
+<section id="t-an" class="tab hide">
+ <div class="panel" style="margin-bottom:12px"><div class="row">
+  <button class="btn" id="bPause" onclick="togglePause()">Pause</button><button class="btn" onclick="clearGraphs()">Clear</button><button class="btn" onclick="location.href='/api/export/csv'">Export CSV</button>
+  <span style="margin-left:8px" class="mono">AXES:</span>
+  <label class="chk"><input type="checkbox" id="axX" checked onchange="drawTime()">X</label><label class="chk"><input type="checkbox" id="axY" checked onchange="drawTime()">Y</label><label class="chk"><input type="checkbox" id="axZ" checked onchange="drawTime()">Z</label><label class="chk"><input type="checkbox" id="axR" checked onchange="drawTime()">Resultant</label>
+  <span id="live" class="mono" style="margin-left:auto;font-size:12px;color:var(--dim)">LIVE: --</span></div>
+  <div id="winInfo" class="mono" style="font-size:11px;color:var(--dim);margin-top:6px">Run a test or baseline recording to see data. Graphs update once per 256-sample window.</div></div>
+ <div class="grid g2">
+  <div class="panel"><h3>1 &middot; Acceleration vs time (DC removed)</h3><canvas id="c1" style="height:260px"></canvas></div>
+  <div class="panel"><h3>2 &middot; FFT frequency spectrum</h3><canvas id="c2" style="height:260px"></canvas></div>
+  <div class="panel"><h3>3 &middot; RMS acceleration per window</h3><canvas id="c3" style="height:220px"></canvas></div>
+  <div class="panel"><h3>4 &middot; Peak acceleration per window</h3><canvas id="c4" style="height:220px"></canvas></div>
+  <div class="panel"><h3>5 &middot; Baseline FFT vs current FFT</h3><canvas id="c5" style="height:240px"></canvas></div>
+  <div class="panel"><h3>6 &middot; Baseline vs current features</h3><canvas id="c6" style="height:240px"></canvas></div>
+ </div>
+</section>
+<section id="t-ob" class="tab hide">
+ <div class="grid g2">
+  <div class="panel"><h3>Object profile</h3><div id="obState" class="note info" style="margin-bottom:10px">--</div>
+   <form id="ofForm" onsubmit="return false"><div class="grid g3" id="ofFields"></div></form>
+   <div class="note info" style="margin:10px 0;font-size:11px">Dimensions, age and material are metadata only. They never create a baseline; only real sensor measurements do.</div>
+   <div class="row"><button class="btn pri" onclick="saveObj()">Save profile</button><button class="btn" onclick="newObj()">New profile</button></div><div id="oMsg" class="mono" style="font-size:12px;margin-top:8px"></div></div>
+  <div class="panel"><h3>Saved profiles (max 3)</h3><div id="oList" style="color:var(--dim)">--</div></div>
+ </div>
+</section>
+<section id="t-hi" class="tab hide">
+ <div class="panel"><h3>Measurement history (last 6, stored in flash)</h3><div class="row" style="margin-bottom:8px"><button class="btn" onclick="location.href='/api/export/csv?type=history'">Export history CSV</button><button class="btn" onclick="loadHistory()">Refresh</button></div>
+  <div style="overflow-x:auto"><table><thead><tr><th>ID</th><th>TIME</th><th>OBJECT</th><th>SCORE</th><th>CATEGORY</th><th>QUALITY</th><th>RMS</th><th>F<sub>dom</sub></th><th></th></tr></thead><tbody id="hList"></tbody></table></div></div>
+ <div class="grid g2" style="margin-top:12px"><div class="panel"><h3>Selected measurement</h3><div id="hDetail" style="color:var(--dim)">Select a measurement.</div></div>
+ <div class="panel"><h3>Spectrum vs baseline</h3><canvas id="hc" style="height:240px"></canvas></div></div>
+</section>
+</main>
+<div id="toast" class="toast hide"></div>
+)=====";
+
+const char HTML_B[] PROGMEM = R"=====(<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const C={bg:'#111820',bg2:'#1A2530',pn:'#222F3B',bl:'#4B607F',wm:'#E8D8C9',or:'#F3701E',gr:'#42A879',am:'#E6B450',rd:'#D95757',dim:'#8a98a8',grid:'#2f3f50'};
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fx=(v,d)=>(v==null||!isFinite(v))?'--':Number(v).toFixed(d==null?2:d);
+const fts=t=>t?new Date(t*1000).toLocaleString():'(time not synced)';
+let tab='ov',S=null,fails=0,busy=false,D=null,lastWin=-1,paused=false,BL=null,OBJ=null,curSlot=-1,HD=null;
+const T={rms:[],peak:[]};let lastTrend=-1;
+let tt=null;
+function toast(m,bad){const t=$('toast');t.textContent=m;t.className='toast'+(bad?' bad':'');clearTimeout(tt);tt=setTimeout(()=>t.classList.add('hide'),4000);}
+async function api(path,opt){const c=new AbortController();const tm=setTimeout(()=>c.abort(),6000);
+ try{const r=await fetch(path,Object.assign({cache:'no-store',signal:c.signal},opt||{}));return await r.json();}finally{clearTimeout(tm);}}
+const post=(p,o)=>api(p,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(o||{}).toString()});
+async function act(p,o,okmsg){try{const j=await post(p,o);if(!j.ok)toast(j.error||'Request failed',true);else if(okmsg)toast(okmsg);await tick();await refreshTab();return j;}
+ catch(e){toast('Device not reachable',true);return {ok:false};}}
+function show(t){tab=t;document.querySelectorAll('section.tab').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
+ document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));refreshTab();}
+async function refreshTab(){try{if(tab==='bl')await loadBaseline();else if(tab==='ob')await loadObjects();else if(tab==='hi')await loadHistory();else if(tab==='an')await pollData();else if(S)drawOverview();}catch(e){}}
+function setPill(id,txt,cls){const e=$(id);e.textContent=txt;e.className='pill '+cls;}
+function setOffline(o){$('offline').classList.toggle('hide',!o);if(o){setPill('pEsp','ESP32: OFFLINE','bad');}}
+// ---------- canvas helpers ----------
+function setupCanvas(c){const r=c.getBoundingClientRect(),d=window.devicePixelRatio||1,w=Math.max(100,Math.floor(r.width)),h=Math.max(100,Math.floor(r.height));
+ if(c.width!==Math.round(w*d)||c.height!==Math.round(h*d)){c.width=Math.round(w*d);c.height=Math.round(h*d);}
+ const g=c.getContext('2d');g.setTransform(d,0,0,d,0,0);g.clearRect(0,0,w,h);return{g,w,h};}
+function emptyMsg(c,m){const{g,w,h}=setupCanvas(c);g.fillStyle=C.dim;g.font='12px ui-monospace,Consolas,monospace';g.textAlign='center';g.fillText(m,w/2,h/2);}
+const tk=v=>Math.abs(v)>=100?v.toFixed(0):Math.abs(v)>=10?v.toFixed(1):v.toFixed(2);
+function plot(c,ser,o){o=o||{};const{g,w,h}=setupCanvas(c);const L=50,R=12,Tp=22,B=30,pw=w-L-R,ph=h-Tp-B;
+ let x0=Infinity,x1=-Infinity,y0=Infinity,y1=-Infinity,cnt=0;
+ ser.forEach(s=>s.y.forEach((v,i)=>{if(v==null||!isFinite(v))return;const x=s.x?s.x[i]:i;if(x<x0)x0=x;if(x>x1)x1=x;if(v<y0)y0=v;if(v>y1)y1=v;cnt++;}));
+ if(!cnt){g.fillStyle=C.dim;g.font='12px ui-monospace,Consolas,monospace';g.textAlign='center';g.fillText(o.empty||'NO DATA',w/2,h/2);return;}
+ (o.h||[]).forEach(l=>{if(l.y<y0)y0=l.y;if(l.y>y1)y1=l.y;});
+ if(o.y0!=null)y0=o.y0;if(x1===x0)x1=x0+1;if(y1===y0){y1+=1;if(o.y0==null)y0-=1;}
+ else{const p=(y1-y0)*0.08;if(o.y0==null)y0-=p;y1+=p;}
+ g.font='10px ui-monospace,Consolas,monospace';g.lineWidth=1;g.strokeStyle=C.grid;g.fillStyle=C.dim;
+ for(let i=0;i<=4;i++){const yy=Tp+ph*i/4;g.beginPath();g.moveTo(L,yy);g.lineTo(L+pw,yy);g.stroke();g.textAlign='right';g.fillText(tk(y1-(y1-y0)*i/4),L-5,yy+3);}
+ for(let i=0;i<=5;i++){const xx=L+pw*i/5;g.beginPath();g.moveTo(xx,Tp);g.lineTo(xx,Tp+ph);g.stroke();g.textAlign='center';g.fillText(tk(x0+(x1-x0)*i/5),xx,h-16);}
+ g.textAlign='center';g.fillText(o.xl||'',L+pw/2,h-4);g.textAlign='left';g.fillText(o.yl||'',L,11);
+ const X=x=>L+(x-x0)/(x1-x0)*pw,Y=y=>Tp+(1-(y-y0)/(y1-y0))*ph;
+ (o.h||[]).forEach(l=>{g.strokeStyle=l.color;g.setLineDash([5,4]);g.beginPath();g.moveTo(L,Y(l.y));g.lineTo(L+pw,Y(l.y));g.stroke();g.setLineDash([]);});
+ g.save();g.beginPath();g.rect(L,Tp,pw,ph);g.clip();
+ ser.forEach(s=>{g.strokeStyle=s.color;g.lineWidth=s.lw||1.3;g.beginPath();let pen=false;
+  s.y.forEach((v,i)=>{if(v==null||!isFinite(v)){pen=false;return;}const x=X(s.x?s.x[i]:i),y=Y(v);if(!pen){g.moveTo(x,y);pen=true;}else g.lineTo(x,y);});g.stroke();
+  if(s.dots)s.y.forEach((v,i)=>{if(v==null||!isFinite(v))return;g.fillStyle=s.color;g.fillRect(X(s.x?s.x[i]:i)-2,Y(v)-2,4,4);});});
+ g.restore();
+ let lx=L+pw-4;g.textAlign='right';ser.concat(o.h||[]).forEach(s=>{if(!s.name)return;g.fillStyle=s.color;g.fillText('\u25A0 '+s.name,lx,Tp+10);lx-=g.measureText('\u25A0 '+s.name).width+12;});}
+// ---------- gauge ----------
+function drawGauge(score,label,sub,col){const c=$('gauge'),{g,w,h}=setupCanvas(c);const cx=w/2,cy=h*0.56,r=Math.min(w*0.42,h*0.40),a0=0.75*Math.PI,a1=2.25*Math.PI;
+ g.lineWidth=16;g.strokeStyle=C.bg;g.beginPath();g.arc(cx,cy,r,a0,a1);g.stroke();
+ const zones=[[0,39,C.rd],[40,64,C.or],[65,84,C.am],[85,100,C.gr]];g.lineWidth=3;
+ zones.forEach(z=>{g.strokeStyle=z[2];g.beginPath();g.arc(cx,cy,r+13,a0+(a1-a0)*z[0]/100,a0+(a1-a0)*(z[1]+(z[1]===100?0:1))/100);g.stroke();});
+ if(score!=null){g.lineWidth=16;g.strokeStyle=col;g.beginPath();g.arc(cx,cy,r,a0,a0+(a1-a0)*score/100);g.stroke();}
+ g.textAlign='center';g.fillStyle=col;
+ if(score!=null){g.font='700 '+Math.round(r*0.62)+'px ui-monospace,Consolas,monospace';g.fillText(score.toFixed(0),cx,cy+r*0.2);g.font='11px ui-monospace,Consolas,monospace';g.fillStyle=C.dim;g.fillText('/ 100',cx,cy+r*0.2+18);}
+ else{g.font='700 '+Math.max(13,Math.round(r*0.2))+'px ui-monospace,Consolas,monospace';g.fillText(label,cx,cy+4);}
+ g.fillStyle=C.dim;g.font='10px ui-monospace,Consolas,monospace';g.fillText('0',cx-r*0.78,cy+r*0.95);g.fillText('100',cx+r*0.78,cy+r*0.95);}
+// ---------- status polling ----------
+async function tick(){if(busy)return;busy=true;
+ try{const j=await api('/api/status?t='+Math.floor(Date.now()/1000));if(!j.ok)throw 0;S=j;fails=0;setOffline(false);renderStatus();}
+ catch(e){if(++fails>=2)setOffline(true);}busy=false;}
+const MET=[['rms','RMS ACCELERATION','m/s\u00B2',3],['peak','PEAK ACCELERATION','m/s\u00B2',3],['domF','DOMINANT FREQUENCY','Hz',1],['p2p','PEAK-TO-PEAK','m/s\u00B2',3],['fs','SAMPLING FREQUENCY','Hz',1],['dur','MEASUREMENT DURATION','s',2],['quality','DATA QUALITY','',0]];
+function renderStatus(){const s=S;
+ setPill('pEsp','ESP32: ONLINE','ok');setPill('pAdx',s.sensor.ok?'ADXL345: CONNECTED':'ADXL345: NOT DETECTED',s.sensor.ok?'ok':'bad');
+ setPill('pWifi','WI-FI: AP \u00B7 '+s.wifi.clients+' CLIENT'+(s.wifi.clients===1?'':'S'),'ok');
+ const r=s.result;
+ if(r&&r.win!==lastTrend){lastTrend=r.win;if(!paused&&r.quality!=='INVALID'&&r.rms!=null){T.rms.push(r.rms);T.peak.push(r.peak);if(T.rms.length>100){T.rms.shift();T.peak.shift();}if(tab==='an')drawTrends();}}
+ if(tab==='ov')drawOverview();}
+function drawOverview(){const s=S;if(!s)return;const r=s.result;
+ $('sEsp').textContent='ONLINE \u00B7 uptime '+Math.floor(s.uptime/60)+' min'+(s.storage?'':' \u00B7 STORAGE ERROR');
+ $('sAdx').textContent=s.sensor.ok?'CONNECTED \u00B7 '+s.sensor.addr+' \u00B7 '+s.sensor.odr+' Hz ODR \u00B7 \u00B1'+s.sensor.range+' g':'NOT DETECTED \u2014 check wiring (errors: '+s.sensor.errors+')';
+ $('sWifi').textContent='AP "'+s.wifi.ssid+'" \u00B7 '+s.wifi.ip+' \u00B7 '+s.wifi.clients+' client(s)';
+ $('sObj').textContent=s.object?s.object.name+' ['+s.object.oid+']':'NONE SELECTED';
+ let ms='IDLE';if(s.mode==='test')ms='TEST RUNNING ('+s.acq.count+'/'+s.acq.n+' samples)';else if(s.mode==='baseline')ms='RECORDING BASELINE ('+s.bl.accepted+'/'+s.bl.max+' windows)';else if(s.phase==='review')ms='BASELINE AWAITING REVIEW';
+ $('sMeas').textContent=ms;$('sTs').textContent=r?fts(r.ts):'--';
+ const nb=$('obBanner');
+ if(!s.object){nb.className='note bad';nb.textContent='NO OBJECT PROFILE \u2014 create one in the OBJECT PROFILE tab.';}
+ else if(!s.object.hasBaseline){nb.className='note';nb.textContent='OBJECT PROFILE CREATED \u2014 BASELINE PENDING. Record a baseline from real measurements.';}
+ else nb.className='note ok hide';
+ $('bTest').disabled=s.mode!=='idle'||!s.object||!s.sensor.ok;$('bStop').disabled=s.mode!=='test';$('bRec').disabled=s.mode==='test'||!s.object||!s.sensor.ok;
+ let lab='',val=null,col=C.dim,cat='',sub='';
+ if(s.mode==='baseline'){lab='RECORDING BASELINE';col=C.or;}
+ else if(!s.object){lab='NO OBJECT';}
+ else if(!r){lab=s.object.hasBaseline?'NO MEASUREMENT':'BASELINE REQUIRED';col=s.object.hasBaseline?C.dim:C.am;}
+ else if(r.state==='insufficient'){lab='INSUFFICIENT DATA';col=C.rd;}
+ else if(r.state==='baseline_required'){lab='BASELINE REQUIRED';col=C.am;}
+ else if(r.state==='not_comparable'){lab='NOT COMPARABLE';col=C.am;}
+ else if(r.score!=null){val=r.score;cat=r.cat;col=val>=85?C.gr:val>=65?C.am:val>=40?C.or:C.rd;}
+ drawGauge(val,lab,sub,col);$('gCat').style.color=col;$('gCat').textContent=cat||'';
+ $('gMeta').textContent=r?('BASELINE ID: '+(r.baseId?('B-'+r.baseId):'--')+'  \u00B7  MEASUREMENT: M-'+r.meas+' (unsaved until test stops)  \u00B7  QUALITY: '+r.quality):'';
+ const mt=$('metrics');if(!mt.dataset.b){mt.innerHTML=MET.map(m=>'<div class="card"><div class="k">'+m[1]+'</div><div class="v" id="m_'+m[0]+'">--</div><div class="u">'+m[2]+'</div></div>').join('');mt.dataset.b='1';}
+ MET.forEach(m=>{const e=$('m_'+m[0]);if(!r)e.textContent='--';else if(m[0]==='quality'){e.textContent=r.quality;e.style.color=r.quality==='GOOD'?C.gr:r.quality==='ACCEPTABLE'?C.am:C.rd;e.style.fontSize='20px';}else e.textContent=fx(r[m[0]],m[3]);});
+ const dl=$('devList');
+ if(r&&r.state==='score'){const a=r.dev.filter(d=>d.d!=null).map(d=>({n:d.n,d:d.d,c:d.d*d.w})).sort((x,y)=>y.c-x.c);
+  dl.innerHTML=a.map(d=>'<div class="dev"><span>'+esc(d.n)+'</span><div class="bar"><i style="width:'+(d.d*100).toFixed(0)+'%;background:'+(d.d>0.5?C.rd:d.d>0.25?C.am:C.gr)+'"></i></div><span class="mono">'+(d.d*100).toFixed(0)+'%</span></div>').join('')+'<div style="font-size:11px;color:var(--dim)">Normalized feature deviation (0% = identical to baseline). Weights: RMS 20, Peak 10, Dom.freq 25, FFT 30, Bands 15.</div>';}
+ else dl.textContent=r&&r.state==='insufficient'?'No score: data quality failed.':'No comparison available.';
+ const ql=$('qList');if(r){ql.innerHTML='<div class="mono" style="font-size:16px;color:'+(r.quality==='GOOD'?C.gr:r.quality==='ACCEPTABLE'?C.am:C.rd)+'">'+r.quality+'</div>'+(r.issues.length?'<ul style="margin:6px 0;padding-left:18px;font-size:12px">'+r.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul>':'<div style="font-size:12px;color:var(--dim)">No issues detected.</div>')+'<div class="mono" style="font-size:11px;color:var(--dim)">fs='+fx(r.fs,1)+' Hz \u00B7 samples='+r.n+' \u00B7 clipped='+r.clip+' \u00B7 |g|='+fx(r.gmag,2)+' m/s\u00B2</div>';}else ql.textContent='--';}
+function startTest(){act('/api/test/start',{},'Test started');}
+async function stopTest(){const j=await act('/api/test/stop');if(j&&j.ok)toast(j.saved?'Measurement M-'+j.id+' saved':'Not saved: '+j.reason,!j.saved);}
+async function recBaseline(){const j=await act('/api/baseline/start');if(j.ok)show('bl');}
+// ---------- baseline tab ----------
+function featTbl(f){return '<div class="kv"><span>RMS</span><span>'+fx(f.rms,4)+' m/s\u00B2</span><span>Peak</span><span>'+fx(f.peak,4)+' m/s\u00B2</span><span>Peak-peak</span><span>'+fx(f.p2p,4)+' m/s\u00B2</span><span>Std dev</span><span>'+fx(f.sd,4)+' m/s\u00B2</span><span>Dominant</span><span>'+fx(f.domF,2)+' Hz</span><span>Sampling</span><span>'+fx(f.fs,1)+' Hz</span><span>Band energy</span><span>'+f.band.map((b,i)=>'B'+(i+1)+' '+(b==null?'--':(b*100).toFixed(0)+'%')).join(' \u00B7 ')+'</span></div><div style="font-size:10px;color:var(--dim);margin-top:4px">Bands: 1-10, 10-25, 25-50, 50-Nyquist Hz</div>';}
+async function loadBaseline(){const j=await api('/api/baseline');if(!j.ok)return;BL=j;
+ const sel=$('blObj');const busyB=j.phase!=='idle'||(S&&S.mode!=='idle');
+ if(document.activeElement!==sel){sel.innerHTML=j.objects.length?j.objects.map(o=>'<option value="'+o.slot+'"'+(o.slot===j.active?' selected':'')+'>'+esc(o.name)+' ['+esc(o.oid)+']'+(o.hasBaseline?' \u2713':'')+'</option>').join(''):'<option>(no objects \u2014 create one first)</option>';}
+ sel.disabled=busyB;
+ const p=j.progress,rec=j.phase==='recording';
+ $('bBlStart').disabled=rec||j.phase==='review'||(S&&S.mode==='test')||j.active<0;$('bBlStop').disabled=!rec;$('bBlSave').disabled=j.phase!=='review';$('bBlRe').disabled=j.phase!=='review';$('bBlCancel').disabled=j.phase==='idle';
+ $('blBar').style.width=(rec?Math.min(100,(p.accepted+p.count/p.n)/p.max*100):j.phase==='review'?100:0)+'%';
+ $('blProg').textContent=rec?('Window '+(p.accepted+p.rejected+1)+' \u00B7 accepted '+p.accepted+'/'+p.max+' (min '+p.min+') \u00B7 rejected '+p.rejected+' \u00B7 samples '+p.count+'/'+p.n):(j.phase==='review'?'Recorded '+p.accepted+' valid windows.':'Idle');
+ $('blMsg').textContent=j.msg||'Ready.';
+ $('blCand').innerHTML=j.candidate?('<div class="mono" style="margin-bottom:6px">ID B-'+j.candidate.id+' \u00B7 '+j.candidate.windows+' windows \u00B7 NOT YET SAVED</div>'+featTbl(j.candidate.f)):'No candidate.';
+ $('blSaved').innerHTML=j.saved?('<div class="mono" style="margin-bottom:6px">ID B-'+j.saved.id+' \u00B7 '+j.saved.windows+' windows \u00B7 '+fts(j.saved.ts)+'</div>'+featTbl(j.saved.f)):'None saved for this object.';
+ const ser=[];const spx=(f)=>f.spec.map((_,k)=>(2*k+0.5)*f.f.fs/256);
+ if(j.saved)ser.push({x:spx({spec:j.saved.f.spec,f:j.saved.f}),y:j.saved.f.spec,color:C.bl,name:'SAVED',lw:2});
+ if(j.candidate)ser.push({x:spx({spec:j.candidate.f.spec,f:j.candidate.f}),y:j.candidate.f.spec,color:C.or,name:'CANDIDATE',lw:2});
+ plot($('bc'),ser,{xl:'frequency (Hz)',yl:'amplitude (m/s\u00B2)',empty:'NO BASELINE SPECTRUM YET',y0:0});}
+async function selObj(v){try{const j=await post('/api/object/select',{slot:v});if(!j.ok)toast(j.error,true);}catch(e){toast('Device not reachable',true);}await tick();await loadBaseline();}
+function blStart(){act('/api/baseline/start',{},'Baseline recording started');}
+async function blStop(){const j=await act('/api/baseline/stop');}
+function blSave(){act('/api/baseline/save',{},'Baseline saved');}
+function blCancel(){act('/api/baseline/stop',{cancel:1},'Cancelled');}
+// ---------- sensor analysis ----------
+async function pollData(){if(paused)return;
+ let sj=null;try{sj=await api('/api/sensor');}catch(e){}
+ if(sj&&sj.ok)$('live').textContent=sj.connected&&sj.x!=null?('LIVE X '+sj.x.toFixed(2)+'  Y '+sj.y.toFixed(2)+'  Z '+sj.z.toFixed(2)+'  |a| '+sj.mag.toFixed(2)+' m/s\u00B2'):'LIVE: SENSOR DISCONNECTED';
+ const j=await api('/api/data?since='+lastWin);
+ if(!j.ok)return;if(!j.has){if(D){D=null;lastWin=-1;}drawAll();return;}
+ if(j.changed===false)return;D=j;lastWin=j.win;
+ $('winInfo').textContent='Window #'+j.win+' \u00B7 fs '+j.fs.toFixed(1)+' Hz \u00B7 resolution '+j.df.toFixed(2)+' Hz/bin \u00B7 quality '+j.quality+' \u00B7 axis RMS X/Y/Z '+j.ax.rms.map(v=>v==null?'--':v.toFixed(3)).join(' / ')+' m/s\u00B2';
+ drawAll();}
+function togglePause(){paused=!paused;$('bPause').textContent=paused?'Resume':'Pause';if(!paused)pollData();}
+function clearGraphs(){T.rms=[];T.peak=[];D=null;lastWin=-1;$('winInfo').textContent='Cleared. New data will appear with the next window.';drawAll();}
+function drawTime(){const c=$('c1');if(!D)return emptyMsg(c,'NO DATA \u2014 START A TEST');
+ const t=D.x.map((_,i)=>i/D.fs),ser=[];
+ if($('axX').checked)ser.push({x:t,y:D.x,color:C.or,name:'X'});if($('axY').checked)ser.push({x:t,y:D.y,color:C.gr,name:'Y'});if($('axZ').checked)ser.push({x:t,y:D.z,color:C.bl,name:'Z',lw:1.6});
+ if($('axR').checked)ser.push({x:t,y:D.x.map((v,i)=>Math.hypot(v,D.y[i],D.z[i])),color:C.wm,name:'RES'});
+ plot(c,ser,{xl:'time (s)',yl:'m/s\u00B2',empty:'SELECT AT LEAST ONE AXIS'});}
+function drawTrends(){const n=T.rms.length,x=T.rms.map((_,i)=>i+1);
+ const hb=(k)=>(D&&D.base&&D.base[k]!=null)?[{y:D.base[k],color:C.am,name:'BASELINE'}]:[];
+ plot($('c3'),n?[{x,y:T.rms,color:C.or,name:'RMS',dots:true}]:[],{xl:'window',yl:'m/s\u00B2',h:n?hb('rms'):[],empty:'NO DATA \u2014 START A TEST',y0:0});
+ plot($('c4'),n?[{x,y:T.peak,color:C.gr,name:'PEAK',dots:true}]:[],{xl:'window',yl:'m/s\u00B2',h:n?hb('peak'):[],empty:'NO DATA \u2014 START A TEST',y0:0});}
+function drawSpec(){const c=$('c2');if(!D)return emptyMsg(c,'NO DATA \u2014 START A TEST');
+ const x=D.spec.map((_,k)=>k*D.df);plot(c,[{x,y:D.spec,color:C.or,name:'CURRENT',lw:1.5}],{xl:'frequency (Hz)',yl:'amplitude (m/s\u00B2)',y0:0});}
+function drawCmp(){const c=$('c5');if(!D)return emptyMsg(c,'NO DATA \u2014 START A TEST');if(!D.base64)return emptyMsg(c,'BASELINE REQUIRED FOR THIS OBJECT');
+ const x=D.cur64.map((_,j)=>(2*j+0.5)*D.df);plot(c,[{x,y:D.base64,color:C.bl,name:'BASELINE',lw:2},{x,y:D.cur64,color:C.or,name:'CURRENT',lw:1.6}],{xl:'frequency (Hz)',yl:'amplitude (m/s\u00B2)',y0:0});}
+function drawBars(){const c=$('c6');if(!D)return emptyMsg(c,'NO DATA \u2014 START A TEST');if(!D.base)return emptyMsg(c,'BASELINE REQUIRED FOR THIS OBJECT');
+ const{g,w,h}=setupCanvas(c);const it=[['RMS',D.f.rms,D.base.rms],['PEAK',D.f.peak,D.base.peak],['P2P',D.f.p2p,D.base.p2p],['SD',D.f.sd,D.base.sd],['F DOM',D.f.domF,D.base.domF]];
+ for(let b=0;b<4;b++)it.push(['B'+(b+1),D.f.band[b],D.base.band[b]]);
+ const n=it.length,gw=(w-16)/n,top=24,bh=h-top-40;g.font='10px ui-monospace,Consolas,monospace';g.textAlign='center';
+ g.fillStyle=C.bl;g.fillText('\u25A0 BASELINE',w-120,12);g.fillStyle=C.or;g.fillText('\u25A0 CURRENT',w-50,12);
+ it.forEach((m,i)=>{const mx=Math.max(m[1]||0,m[2]||0)||1,x=8+i*gw,bw=gw*0.3;
+  g.fillStyle=C.bl;const hb=(m[2]||0)/mx*bh;g.fillRect(x+gw*0.15,top+bh-hb,bw,hb);
+  g.fillStyle=C.or;const hc=(m[1]||0)/mx*bh;g.fillRect(x+gw*0.55,top+bh-hc,bw,hc);
+  g.fillStyle=C.wm;g.fillText(m[0],x+gw/2,h-24);g.fillStyle=C.dim;g.fillText(m[2]>0&&m[1]!=null?(m[1]/m[2]*100).toFixed(0)+'%':'--',x+gw/2,h-10);});}
+function drawAll(){drawTime();drawSpec();drawTrends();drawCmp();drawBars();}
+// ---------- object profile ----------
+const OF=[['name','Object name','text'],['oid','Object ID','text'],['cat','Object category','text'],['len','Length (mm)','number'],['wid','Width (mm)','number'],['thk','Thickness (mm)','number'],
+['mat','Material','select',['Aluminium','Mild steel','Stainless steel','Concrete','Wood','PVC','Other']],['age','Approx. age (years)','number'],['inst','Installation date','date'],
+['cond','Visible condition','text'],['defects','Known defects','text'],['repairs','Previous repairs','text'],['env','Environmental conditions','text'],
+['pos','Sensor mounting position','text'],['orient','Sensor orientation','text'],['attach','Sensor attachment method','text'],['excit','Excitation method','text']];
+function buildForm(){$('ofFields').innerHTML=OF.map(f=>'<div><label>'+f[1]+'</label>'+(f[2]==='select'?'<select id="f_'+f[0]+'">'+f[3].map(o=>'<option>'+o+'</option>').join('')+'</select>':'<input id="f_'+f[0]+'" type="'+f[2]+'"'+(f[2]==='number'?' min="0" step="any"':' maxlength="64"')+'>')+'</div>').join('');}
+function fillForm(f){OF.forEach(o=>{$('f_'+o[0]).value=f?f[o[0]]:(o[2]==='select'?o[3][0]:'');});}
+function newObj(){curSlot=-1;fillForm(null);$('oMsg').textContent='New profile';}
+async function loadObjects(){const j=await api('/api/object');if(!j.ok)return;OBJ=j;
+ $('oList').innerHTML=j.objects.length?'<table><tbody>'+j.objects.map(o=>'<tr><td><b>'+esc(o.f.name)+'</b><br><span class="mono" style="font-size:11px;color:var(--dim)">'+esc(o.f.oid)+' \u00B7 '+esc(o.f.mat)+' \u00B7 '+(o.hasBaseline?'BASELINE B-'+o.baseId:'BASELINE PENDING')+'</span></td><td style="text-align:right;white-space:nowrap">'+(o.slot===j.active?'<span class="pill ok">ACTIVE</span> ':'<button class="btn" onclick="useObj('+o.slot+')">Select</button> ')+'<button class="btn" onclick="editObj('+o.slot+')">Edit</button> <button class="btn dng" onclick="delObj('+o.slot+')">Del</button></td></tr>').join('')+'</tbody></table>':'No profiles saved yet.';
+ const a=j.objects.find(o=>o.slot===j.active),st=$('obState');
+ if(!a){st.className='note bad';st.textContent='NO OBJECT PROFILE YET \u2014 fill the form and save.';}
+ else if(!a.hasBaseline){st.className='note';st.textContent='OBJECT PROFILE CREATED \u2014 BASELINE PENDING ('+a.f.name+')';}
+ else{st.className='note ok';st.textContent='Active object "'+a.f.name+'" has baseline B-'+a.baseId+'.';}
+ if(!$('f_name').dataset.init){$('f_name').dataset.init='1';fillForm(null);}}
+function editObj(s){const o=OBJ.objects.find(x=>x.slot===s);if(!o)return;curSlot=s;fillForm(o.f);$('oMsg').textContent='Editing profile in slot '+(s+1);}
+async function saveObj(){const p={slot:curSlot};OF.forEach(o=>p[o[0]]=$('f_'+o[0]).value);
+ try{const j=await post('/api/object/save',p);if(j.ok){curSlot=j.slot;$('oMsg').style.color=C.gr;$('oMsg').textContent='Saved to flash.';toast('Object profile saved');}else{$('oMsg').style.color=C.rd;$('oMsg').textContent=j.error;}}catch(e){toast('Device not reachable',true);}
+ await tick();await loadObjects();}
+async function useObj(s){await act('/api/object/select',{slot:s},'Object selected');}
+async function delObj(s){if(!confirm('Delete this object, its baseline and its history?'))return;if(curSlot===s)newObj();await act('/api/object/delete',{slot:s},'Deleted');}
+// ---------- history ----------
+async function loadHistory(){const j=await api('/api/history');if(!j.ok)return;j.items.sort((a,b)=>b.id-a.id);
+ $('hList').innerHTML=j.items.length?j.items.map(m=>'<tr><td class="mono">M-'+m.id+'</td><td>'+fts(m.ts)+'</td><td>'+esc(m.objName)+'</td><td class="mono"><b>'+(m.score==null?'--':m.score.toFixed(0))+'</b></td><td>'+(m.cat||'--')+'</td><td>'+m.quality+'</td><td class="mono">'+fx(m.rms,3)+'</td><td class="mono">'+fx(m.domF,1)+'</td><td style="white-space:nowrap"><button class="btn" onclick="openM('+m.id+')">Open</button> <button class="btn dng" onclick="delM('+m.id+')">Del</button></td></tr>').join(''):'<tr><td colspan="9" style="color:var(--dim)">No saved measurements. Run a test and press STOP TEST to save one.</td></tr>';}
+async function openM(id){const j=await api('/api/history?id='+id);if(!j.ok){toast(j.error,true);return;}const m=j.m;let h='<div class="mono" style="margin-bottom:6px">M-'+m.id+' \u00B7 '+esc(m.objName)+' \u00B7 '+fts(m.ts)+'</div>'+featTbl(m.f)+'<div style="margin-top:8px" class="kv"><span>Stored score</span><span>'+(m.score==null?'--':m.score.toFixed(1)+' ('+m.cat+') vs baseline B-'+m.baseId)+'</span><span>Quality</span><span>'+m.quality+(m.issues.length?' \u2014 '+m.issues.map(esc).join('; '):'')+'</span>';
+ if(j.cmp){h+='<span>Compare now</span><span>'+(j.cmp.ok?j.cmp.score.toFixed(1)+' ('+j.cmp.cat+') vs current baseline B-'+j.baseline.id:'not comparable')+'</span>';}else h+='<span>Compare now</span><span>No baseline saved for this object</span>';
+ h+='</div>';if(j.cmp&&j.cmp.ok)h+='<div style="margin-top:8px">'+j.cmp.dev.filter(d=>d.d!=null).map(d=>'<div class="dev"><span>'+esc(d.n)+'</span><div class="bar"><i style="width:'+(d.d*100).toFixed(0)+'%"></i></div><span class="mono">'+(d.d*100).toFixed(0)+'%</span></div>').join('')+'</div>';
+ $('hDetail').innerHTML=h;const sp=(f)=>f.spec.map((_,k)=>(2*k+0.5)*f.fs/256);const ser=[{x:sp(m.f),y:m.f.spec,color:C.or,name:'MEASUREMENT',lw:1.8}];
+ if(j.baseline)ser.unshift({x:sp(j.baseline.f),y:j.baseline.f.spec,color:C.bl,name:'BASELINE',lw:2});plot($('hc'),ser,{xl:'frequency (Hz)',yl:'amplitude (m/s\u00B2)',y0:0});}
+async function delM(id){if(!confirm('Delete measurement M-'+id+'?'))return;try{const j=await post('/api/history/delete',{id:id});if(!j.ok)toast(j.error,true);}catch(e){toast('Device not reachable',true);}$('hDetail').textContent='Select a measurement.';loadHistory();}
+// ---------- init ----------
+buildForm();fillForm(null);show('ov');tick();
+setInterval(tick,1000);
+setInterval(()=>{if(tab==='bl')loadBaseline().catch(()=>{});else if(tab==='an')pollData().catch(()=>{});},1000);
+window.addEventListener('resize',()=>{if(tab==='an')drawAll();else if(tab==='ov')drawOverview();});
+</script></body></html>
+)=====";
+
+const char HTML_C[] PROGMEM = "";
